@@ -1571,6 +1571,7 @@ dependencies = [
  "ringbuf",
  "walkdir",
  "wgpu",
+ "windows 0.54.0",
  "winres",
 ]
 

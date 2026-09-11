@@ -34,6 +34,22 @@ cpal = "0.15"
 ringbuf = "0.4"
 pollster = "0.3"
 
+# Native WASAPI audio output on Windows. Playback timing comes from the
+# device clock (which sample is at the speakers right now) instead of
+# cpal's buffer-size estimate, which leaves out the audio engine and the
+# device's own latency. Same version and a subset of the features cpal
+# already builds, so this adds no new crate.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.54"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+]
+
 # Patched locally: upstream 2.0.1 panics in
 # software::resampling::context::Context::get_with2 when the source audio
 # stream has ChannelOrder::Unspecified / Custom (common in iPhone AAC),

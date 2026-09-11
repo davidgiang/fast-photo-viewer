@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod media;
+mod recycle;
 mod video_player;
 
 use eframe::egui;
@@ -7,46 +9,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::process::Command;
-use std::fs;
 use std::collections::HashSet;
 use walkdir::WalkDir;
 use rand::seq::SliceRandom;
 use image::DynamicImage;
+use crate::media::{
+    decode_image, is_image_file, is_supported_file, is_video_file, IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+};
 use crate::video_player::{Player, PlayerState};
 use ffmpeg_the_third as ffmpeg;
-
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "bmp", "webp", "gif", "tiff", "ico", "svg",
-    // HEIF family (decoded via ffmpeg)
-    "heic", "heif", "avif",
-    // Camera raw (decoded via rawloader + imagepipe)
-    "nef", "nrw", "cr2", "arw", "srf", "sr2", "dng", "raf",
-    "rw2", "orf", "pef", "srw", "3fr", "mrw", "iiq", "kdc",
-    "dcr", "rwl", "x3f", "mef", "mos",
-];
-
-const RAW_EXTENSIONS: &[&str] = &[
-    "nef", "nrw", "cr2", "arw", "srf", "sr2", "dng", "raf",
-    "rw2", "orf", "pef", "srw", "3fr", "mrw", "iiq", "kdc",
-    "dcr", "rwl", "x3f", "mef", "mos",
-];
-
-const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
-
-fn has_ext(path: &Path, exts: &[&str]) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| exts.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-fn is_raw_file(path: &Path) -> bool { has_ext(path, RAW_EXTENSIONS) }
-fn is_heif_file(path: &Path) -> bool { has_ext(path, HEIF_EXTENSIONS) }
-
-const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v",
-    "mpg", "mpeg", "3gp", "ogv", "ts", "vob",
-];
 
 #[derive(Clone, Copy, PartialEq)]
 enum MediaFilter {
@@ -95,22 +67,37 @@ impl ViewOrder {
     }
 }
 
-fn is_image_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+/// Which end of the A-B clip loop a seek-bar drag is moving.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipMarker {
+    Start,
+    End,
 }
 
-fn is_video_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+/// A short-lived status message shown over the media, used for actions
+/// whose result isn't otherwise visible on screen — chiefly deletes,
+/// where the user needs to know whether the file actually made it to
+/// the Recycle Bin.
+struct Toast {
+    text: String,
+    is_error: bool,
+    shown_at: std::time::Instant,
 }
 
-fn is_supported_file(path: &Path) -> bool {
-    is_image_file(path) || is_video_file(path)
+impl Toast {
+    const LIFETIME: std::time::Duration = std::time::Duration::from_millis(2600);
+
+    fn new(text: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            text: text.into(),
+            is_error,
+            shown_at: std::time::Instant::now(),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.shown_at.elapsed() > Self::LIFETIME
+    }
 }
 
 fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
@@ -123,68 +110,6 @@ fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
 
 // `file_has_audio_stream` was used by the old egui-video path; the in-
 // house player now owns audio probing internally.
-
-/// Scan a byte slice for the largest embedded JPEG (SOI..EOI). Works
-/// because within a valid JPEG payload, any `0xFF` byte is followed by
-/// `0x00` (stuff byte), so `FF D9` only appears as a real end-of-image.
-fn find_largest_embedded_jpeg(data: &[u8]) -> Option<&[u8]> {
-    let mut best: Option<&[u8]> = None;
-    let mut i = 0;
-    while i + 2 < data.len() {
-        if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
-            let mut j = i + 2;
-            while j + 1 < data.len() {
-                if data[j] == 0xFF && data[j + 1] == 0xD9 {
-                    let slice = &data[i..j + 2];
-                    if best.map_or(true, |b| slice.len() > b.len()) {
-                        best = Some(slice);
-                    }
-                    i = j + 2;
-                    break;
-                }
-                j += 1;
-            }
-            if j + 1 >= data.len() {
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    best
-}
-
-/// Decode a camera RAW file (NEF, CR2, ARW, DNG, etc.) to an sRGB image.
-/// Fast path: extract the full-resolution JPEG preview every modern
-/// camera embeds. Fallback: full rawloader + imagepipe demosaic (slow,
-/// and only works for camera models in rawloader's database).
-fn decode_raw_image(path: &Path) -> Result<DynamicImage, String> {
-    if let Ok(bytes) = fs::read(path) {
-        if let Some(jpeg) = find_largest_embedded_jpeg(&bytes) {
-            // Require at least 64 KB so we don't pick up a tiny thumbnail
-            // when a larger preview exists further in the file.
-            if jpeg.len() >= 64 * 1024 {
-                if let Ok(img) = image::load_from_memory(jpeg) {
-                    return Ok(img);
-                }
-            }
-        }
-    }
-
-    // Fallback: full raw decode via rawloader + imagepipe.
-    let mut pipeline = imagepipe::Pipeline::new_from_file(path)
-        .map_err(|e| format!("raw open: {:?}", e))?;
-    let decoded = pipeline
-        .output_8bit(None)
-        .map_err(|e| format!("raw pipeline: {:?}", e))?;
-    let buf = image::RgbImage::from_raw(
-        decoded.width as u32,
-        decoded.height as u32,
-        decoded.data,
-    )
-    .ok_or_else(|| "raw: buffer size mismatch".to_string())?;
-    Ok(DynamicImage::ImageRgb8(buf))
-}
 
 /// Extract `count` evenly-spaced thumbnail frames from a video for use
 /// as a seek preview strip. Runs on a background thread; writes each
@@ -225,12 +150,14 @@ fn extract_seek_thumbnails(
         Err(_) => return,
     };
 
+    // swscale asserts internally on zero-sized input rather than
+    // returning an error, so bail before constructing the context.
+    if crate::media::validate_dimensions(src_w, src_h).is_err() {
+        return;
+    }
+
     let thumb_w: u32 = 192;
-    let thumb_h: u32 = if src_w > 0 {
-        ((thumb_w as u64 * src_h as u64) / src_w as u64).max(1) as u32
-    } else {
-        108
-    };
+    let thumb_h: u32 = ((thumb_w as u64 * src_h as u64) / src_w as u64).max(1) as u32;
 
     let mut scaler = match ffmpeg::software::scaling::context::Context::get(
         src_format,
@@ -296,6 +223,12 @@ fn extract_seek_thumbnails(
         let stride = rgb.stride(0);
         let src = rgb.data(0);
         let row_bytes = w * 4;
+        // Guard the row slicing: a frame whose plane is shorter than
+        // its reported geometry would panic the thumbnail thread, and
+        // an unwind here kills the whole process.
+        if w == 0 || h == 0 || stride < row_bytes || src.len() < (h - 1) * stride + row_bytes {
+            continue;
+        }
         let mut buf = Vec::with_capacity(row_bytes * h);
         for y in 0..h {
             let start = y * stride;
@@ -311,87 +244,6 @@ fn extract_seek_thumbnails(
         }
         ctx.request_repaint();
     }
-}
-
-/// Decode a single-frame HEIF/HEIC/AVIF image through ffmpeg. We treat
-/// the file as a one-frame video, decode the first frame, and convert
-/// to RGB24 via swscale.
-fn decode_heif_image(path: &Path) -> Result<DynamicImage, String> {
-    let mut ictx = ffmpeg::format::input(&path)
-        .map_err(|e| format!("heif open: {}", e))?;
-
-    let stream_index = ictx
-        .streams()
-        .best(ffmpeg::media::Type::Video)
-        .ok_or_else(|| "heif: no video stream".to_string())?
-        .index();
-
-    let params = ictx
-        .stream(stream_index)
-        .ok_or_else(|| "heif: missing stream".to_string())?
-        .parameters();
-    let decoder_ctx = ffmpeg::codec::context::Context::from_parameters(params)
-        .map_err(|e| format!("heif codec ctx: {}", e))?;
-    let mut decoder = decoder_ctx
-        .decoder()
-        .video()
-        .map_err(|e| format!("heif decoder: {}", e))?;
-
-    let mut scaler = ffmpeg::software::scaling::context::Context::get(
-        decoder.format(),
-        decoder.width(),
-        decoder.height(),
-        ffmpeg::format::Pixel::RGB24,
-        decoder.width(),
-        decoder.height(),
-        ffmpeg::software::scaling::flag::Flags::BILINEAR,
-    )
-    .map_err(|e| format!("heif scaler: {}", e))?;
-
-    let extract = |scaler: &mut ffmpeg::software::scaling::context::Context,
-                   frame: &ffmpeg::frame::Video|
-     -> Result<DynamicImage, String> {
-        let mut rgb = ffmpeg::frame::Video::empty();
-        scaler
-            .run(frame, &mut rgb)
-            .map_err(|e| format!("heif scale: {}", e))?;
-        let w = rgb.width();
-        let h = rgb.height();
-        let stride = rgb.stride(0);
-        let src = rgb.data(0);
-        let row_bytes = w as usize * 3;
-        let mut buf = Vec::with_capacity(row_bytes * h as usize);
-        for y in 0..h as usize {
-            let start = y * stride;
-            buf.extend_from_slice(&src[start..start + row_bytes]);
-        }
-        let img = image::RgbImage::from_raw(w, h, buf)
-            .ok_or_else(|| "heif: buffer size mismatch".to_string())?;
-        Ok(DynamicImage::ImageRgb8(img))
-    };
-
-    let mut frame = ffmpeg::frame::Video::empty();
-    for item in ictx.packets() {
-        let (stream, packet) = item.map_err(|e| format!("heif packet: {}", e))?;
-        if stream.index() != stream_index {
-            continue;
-        }
-        decoder
-            .send_packet(&packet)
-            .map_err(|e| format!("heif send: {}", e))?;
-        if decoder.receive_frame(&mut frame).is_ok() {
-            return extract(&mut scaler, &frame);
-        }
-    }
-
-    decoder
-        .send_eof()
-        .map_err(|e| format!("heif eof: {}", e))?;
-    if decoder.receive_frame(&mut frame).is_ok() {
-        return extract(&mut scaler, &frame);
-    }
-
-    Err("heif: no frame decoded".to_string())
 }
 
 fn main() -> eframe::Result<()> {
@@ -480,6 +332,14 @@ struct PhotoViewer {
     // release so the decoder isn't hammered every frame.
     scrubbing: Option<f32>,
 
+    // A-B clip loop, in milliseconds from the start of the current
+    // video. Both are per-video and cleared whenever new media loads.
+    clip_start_ms: Option<i64>,
+    clip_end_ms: Option<i64>,
+    /// Set while a seek-bar drag is moving a clip marker rather than
+    /// scrubbing playback.
+    clip_drag: Option<ClipMarker>,
+
     // YouTube-style preview thumbnails for the current video: the bg
     // thread fills `seek_thumbs`, and the main thread lazily uploads
     // each one into `seek_thumb_textures` the first time it's needed.
@@ -488,6 +348,7 @@ struct PhotoViewer {
 
     // UI state
     last_esc_press: Option<std::time::Instant>,
+    toast: Option<Toast>,
 
     // History
     history: Vec<PathBuf>,
@@ -507,6 +368,10 @@ struct PhotoViewer {
     error_msg: Option<String>,
     pending_initial_file: Option<PathBuf>,
     wgpu_backend: Option<video_player::WgpuBackend>,
+    /// Smoothed time between UI frames while video plays — the display
+    /// refresh interval, near enough. A frame chosen in `update()` is on
+    /// screen about one interval later, so the player picks for then.
+    frame_interval_secs: f32,
 }
 
 impl PhotoViewer {
@@ -537,9 +402,13 @@ impl PhotoViewer {
             seek_frac: 0.0,
             video_rotation: 0,
             scrubbing: None,
+            clip_start_ms: None,
+            clip_end_ms: None,
+            clip_drag: None,
             seek_thumbs: Arc::new(Mutex::new(Vec::new())),
             seek_thumb_textures: Vec::new(),
             last_esc_press: None,
+            toast: None,
             history: Vec::new(),
             history_index: None,
             zoom: 1.0,
@@ -547,6 +416,7 @@ impl PhotoViewer {
             media_filter: MediaFilter::All,
             view_order: ViewOrder::Random,
             wgpu_backend,
+            frame_interval_secs: 1.0 / 60.0,
             is_scanning: Arc::new(Mutex::new(false)),
             scan_count: Arc::new(Mutex::new(0)),
             texture: None,
@@ -748,6 +618,213 @@ impl PhotoViewer {
         }
     }
 
+    /// Position playback should return to when a finished video is
+    /// restarted: the clip in-point when one is set, otherwise zero.
+    fn replay_origin_us(&self) -> i64 {
+        self.clip_start_ms.unwrap_or(0).max(0) * 1000
+    }
+
+    /// Play/pause toggle shared by the spacebar, the click-on-video
+    /// gesture, and the transport button.
+    fn toggle_playback(&mut self) {
+        let origin_us = self.replay_origin_us();
+        let Some(player) = &mut self.video_player else {
+            return;
+        };
+        match player.state() {
+            PlayerState::Playing => player.pause(),
+            PlayerState::Paused => player.play(),
+            PlayerState::EndOfFile => {
+                player.seek_us(origin_us);
+                player.play();
+            }
+            _ => player.play(),
+        }
+    }
+
+    /// Clear the A-B clip loop and tell the player to stop wrapping.
+    fn clear_clip_range(&mut self) {
+        self.clip_start_ms = None;
+        self.clip_end_ms = None;
+        self.clip_drag = None;
+        if let Some(player) = &mut self.video_player {
+            player.set_loop_range(None, None);
+        }
+    }
+
+    /// Push the current markers down to the player, normalising them
+    /// first: markers are kept inside the video, ordered, and never
+    /// closer together than `MIN_CLIP_MS` — a zero-length clip would
+    /// make the demuxer seek on every frame.
+    fn commit_clip_range(&mut self) {
+        const MIN_CLIP_MS: i64 = 100;
+        let Some(player) = &mut self.video_player else {
+            return;
+        };
+        let duration_ms = player.duration_ms();
+        if duration_ms <= 0 {
+            return;
+        }
+
+        let clamp = |v: i64| v.clamp(0, duration_ms);
+        let mut start = self.clip_start_ms.map(clamp);
+        let mut end = self.clip_end_ms.map(clamp);
+
+        // Markers set out of order are a normal way to work (mark the
+        // end of an interesting moment, then its start), so swap
+        // rather than reject.
+        if let (Some(a), Some(b)) = (start, end) {
+            if a > b {
+                std::mem::swap(&mut start, &mut end);
+            }
+        }
+        if let (Some(a), Some(b)) = (start, end) {
+            if b - a < MIN_CLIP_MS {
+                end = Some((a + MIN_CLIP_MS).min(duration_ms));
+                if end == Some(a) {
+                    start = Some((a - MIN_CLIP_MS).max(0));
+                }
+            }
+        }
+
+        self.clip_start_ms = start;
+        self.clip_end_ms = end;
+        player.set_loop_range(start.map(|ms| ms * 1000), end.map(|ms| ms * 1000));
+
+        // Jump back into the clip if the playhead is already past it,
+        // so setting an out-point behind the current position doesn't
+        // leave playback stranded outside the loop.
+        if let (Some(a), Some(b)) = (start, end) {
+            if player.elapsed_ms() > b {
+                player.seek_us(a * 1000);
+            }
+        }
+    }
+
+    /// Set one end of the clip loop to the current playback position.
+    fn set_clip_marker_at_playhead(&mut self, marker: ClipMarker) {
+        let Some(player) = &self.video_player else {
+            return;
+        };
+        if player.duration_ms() <= 0 {
+            return;
+        }
+        let now_ms = player.elapsed_ms();
+        match marker {
+            ClipMarker::Start => self.clip_start_ms = Some(now_ms),
+            ClipMarker::End => self.clip_end_ms = Some(now_ms),
+        }
+        self.commit_clip_range();
+        let (a, b) = (self.clip_start_ms, self.clip_end_ms);
+        self.toast = Some(Toast::new(
+            match (a, b) {
+                (Some(a), Some(b)) => format!(
+                    "Clip {} – {}  ({})",
+                    Self::format_time(a),
+                    Self::format_time(b),
+                    Self::format_time(b - a)
+                ),
+                (Some(a), None) => format!("Clip start {}  (] sets the end)", Self::format_time(a)),
+                (None, Some(b)) => format!("Clip end {}  ([ sets the start)", Self::format_time(b)),
+                (None, None) => "Clip loop cleared".to_string(),
+            },
+            false,
+        ));
+    }
+
+    /// Move the current file to the Recycle Bin and advance to the
+    /// next one.
+    fn delete_current_media(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.current_media_path.clone() else {
+            return;
+        };
+
+        // The decoder thread holds the file open, and Windows refuses
+        // to move a file with an open handle. Tear the player down
+        // first — `Player::drop` waits for the decode thread to exit.
+        let was_video = self.is_video;
+        if was_video {
+            self.video_player = None;
+            self.is_video = false;
+        }
+
+        match recycle::move_to_recycle_bin(&path) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                self.forget_media(&path);
+                self.toast = Some(Toast::new(format!("Moved to Recycle Bin: {}", name), false));
+                self.advance_after_delete(&path, ctx);
+            }
+            Err(e) => {
+                let msg = format!("Delete failed: {}", e);
+                println!("{}", msg);
+                self.toast = Some(Toast::new(msg, true));
+                // The delete didn't happen, so put the viewer back the
+                // way it was rather than leaving a blank screen.
+                if was_video {
+                    self.load_media(path, ctx);
+                }
+            }
+        }
+    }
+
+    /// Drop every reference to a path that no longer exists.
+    fn forget_media(&mut self, path: &Path) {
+        // Take the two locks one at a time. The scan thread acquires
+        // `media_paths` before `scan_count`, so holding `scan_count`
+        // across a `media_paths` lock here would invert that order.
+        let remaining = {
+            let mut paths = self.media_paths.lock().unwrap();
+            paths.retain(|p| p != path);
+            paths.len()
+        };
+        *self.scan_count.lock().unwrap() = remaining;
+
+        self.history.retain(|p| p != path);
+        if self.history.is_empty() {
+            self.history_index = None;
+        } else if let Some(idx) = self.history_index {
+            self.history_index = Some(idx.min(self.history.len() - 1));
+        }
+    }
+
+    /// Show something after a delete: the next file in the current
+    /// order, or an empty viewer when nothing is left.
+    fn advance_after_delete(&mut self, deleted: &Path, ctx: &egui::Context) {
+        // `ordered_step` navigates relative to `current_media_path`,
+        // which has just been removed from the list. Anchor on the
+        // nearest surviving neighbour instead.
+        let replacement = {
+            let paths = self.media_paths.lock().unwrap();
+            paths
+                .iter()
+                .find(|p| p.as_path() > deleted && matches_filter(p, self.media_filter))
+                .or_else(|| paths.iter().rev().find(|p| matches_filter(p, self.media_filter)))
+                .cloned()
+        };
+
+        self.current_media_path = None;
+        self.texture = None;
+        self.current_image = None;
+        self.clear_clip_range();
+        self.reset_view();
+
+        match (self.view_order, replacement) {
+            (ViewOrder::Random, _) => self.next_random_media(ctx),
+            (ViewOrder::Ordered, Some(next)) => {
+                self.current_media_path = Some(next.clone());
+                self.load_media(next, ctx);
+            }
+            (ViewOrder::Ordered, None) => {
+                self.is_video = false;
+            }
+        }
+    }
+
     fn open_in_explorer(&self) {
         if let Some(path) = &self.current_media_path {
             #[cfg(target_os = "windows")]
@@ -765,6 +842,11 @@ impl PhotoViewer {
     }
 
     fn load_media(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // Clip markers refer to positions inside one specific video,
+        // so they never carry over to the next file.
+        self.clip_start_ms = None;
+        self.clip_end_ms = None;
+        self.clip_drag = None;
         if is_video_file(&path) {
             self.load_video(path, ctx);
         } else {
@@ -821,38 +903,7 @@ impl PhotoViewer {
         self.video_player = None;
         self.is_video = false;
 
-        let result = if is_raw_file(&path) {
-            // Raw decoding can panic inside rawloader/imagepipe on malformed
-            // files; catch and report as error.
-            let p = path.clone();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_raw_image(&p))) {
-                Ok(r) => r,
-                Err(_) => Err("raw decoder panicked".to_string()),
-            }
-        } else if is_heif_file(&path) {
-            decode_heif_image(&path)
-        } else {
-            match fs::read(&path).map_err(|e| e.to_string()) {
-                Ok(mut bytes) => match image::load_from_memory(&bytes) {
-                    Ok(img) => Ok(img),
-                    Err(e) => {
-                        if bytes.len() > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
-                            println!("Attempting to repair truncated JPEG: {}", path.display());
-                            bytes.push(0xFF);
-                            bytes.push(0xD9);
-                            bytes.extend(std::iter::repeat(0).take(1024));
-
-                            image::load_from_memory(&bytes).map_err(|retry_err| {
-                                format!("Original: {}, Retry: {}", e, retry_err)
-                            })
-                        } else {
-                            Err(e.to_string())
-                        }
-                    }
-                },
-                Err(e) => Err(e),
-            }
-        };
+        let result = decode_image(&path);
 
         match result {
             Ok(image) => {
@@ -970,6 +1021,14 @@ impl eframe::App for PhotoViewer {
 
         // Upload any new decoded video frames.
         if let Some(player) = &mut self.video_player {
+            // Video repaints continuously, so the gap between updates
+            // tracks the display's refresh interval. Ignore outliers from
+            // idle periods and window drags.
+            let dt = ctx.input(|i| i.unstable_dt);
+            if (0.002..0.1).contains(&dt) {
+                self.frame_interval_secs = self.frame_interval_secs * 0.9 + dt * 0.1;
+            }
+            player.set_display_lead(std::time::Duration::from_secs_f32(self.frame_interval_secs));
             player.tick();
         }
 
@@ -1043,17 +1102,19 @@ impl eframe::App for PhotoViewer {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 // Space toggles play/pause for video
-                if let Some(player) = &mut self.video_player {
-                    match player.state() {
-                        PlayerState::Playing => player.pause(),
-                        PlayerState::Paused => player.play(),
-                        PlayerState::EndOfFile => {
-                            player.seek(0.0);
-                            player.play();
-                        }
-                        _ => {}
-                    }
-                }
+                self.toggle_playback();
+            }
+            // A-B clip loop: [ marks the in-point, ] the out-point,
+            // \ clears both.
+            if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+                self.set_clip_marker_at_playhead(ClipMarker::Start);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+                self.set_clip_marker_at_playhead(ClipMarker::End);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Backslash)) {
+                self.clear_clip_range();
+                self.toast = Some(Toast::new("Clip loop cleared", false));
             }
         } else {
             // Image mode: original behavior
@@ -1063,6 +1124,12 @@ impl eframe::App for PhotoViewer {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 self.go_prev(ctx);
             }
+        }
+
+        // Delete: move the current file to the Recycle Bin. Recoverable
+        // from Explorer, so it acts immediately rather than prompting.
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.delete_current_media(ctx);
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::O)) {
@@ -1129,6 +1196,11 @@ impl eframe::App for PhotoViewer {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
 
             if self.is_video {
+                // Set when a control inside the panel changes the clip
+                // markers. `commit_clip_range` needs `&mut self`, which
+                // can't be taken while `player` is borrowed below, so
+                // the work is deferred until that borrow ends.
+                let mut clip_dirty = false;
                 // Video rendering
                 if let Some(player) = &mut self.video_player {
                     let available = rect.size();
@@ -1144,11 +1216,12 @@ impl eframe::App for PhotoViewer {
                         self.pan += video_interact.drag_delta();
                     }
                     if video_interact.clicked() {
+                        let origin_us = self.clip_start_ms.unwrap_or(0).max(0) * 1000;
                         match player.state() {
                             PlayerState::Playing => player.pause(),
                             PlayerState::Paused => player.play(),
                             PlayerState::EndOfFile => {
-                                player.seek(0.0);
+                                player.seek_us(origin_us);
                                 player.play();
                             }
                             _ => {}
@@ -1275,21 +1348,75 @@ impl eframe::App for PhotoViewer {
                                             .clamp(0.0, 1.0)
                                     });
 
+                                // Clip markers, as fractions of the bar,
+                                // so hit-testing and painting work off the
+                                // same numbers.
+                                let to_frac = |ms: i64| {
+                                    if duration > 0 {
+                                        (ms as f32 / duration as f32).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    }
+                                };
+                                let clip_a = self.clip_start_ms.map(to_frac);
+                                let clip_b = self.clip_end_ms.map(to_frac);
+
+                                // A drag that starts on a marker moves it;
+                                // anywhere else scrubs. Hit-test in pixels so
+                                // the grab area stays the same size no matter
+                                // how long the video is.
+                                let grab_px = 7.0;
+                                let marker_under = |frac: f32| -> Option<ClipMarker> {
+                                    let x = bar_rect.left() + bar_rect.width() * frac;
+                                    let near = |m: Option<f32>| {
+                                        m.map(|mf| {
+                                            (bar_rect.left() + bar_rect.width() * mf - x)
+                                                .abs()
+                                                <= grab_px
+                                        })
+                                        .unwrap_or(false)
+                                    };
+                                    if near(clip_a) {
+                                        Some(ClipMarker::Start)
+                                    } else if near(clip_b) {
+                                        Some(ClipMarker::End)
+                                    } else {
+                                        None
+                                    }
+                                };
+
                                 // While dragging, buffer the target position and
                                 // commit it on release — calling player.seek() on
                                 // every drag frame causes noticeable lag.
                                 if bar_response.drag_started() {
                                     if let Some(f) = pointer_frac {
-                                        self.scrubbing = Some(f);
+                                        match marker_under(f) {
+                                            Some(marker) => self.clip_drag = Some(marker),
+                                            None => self.scrubbing = Some(f),
+                                        }
                                     }
                                 }
                                 if bar_response.dragged() {
                                     if let Some(f) = pointer_frac {
-                                        self.scrubbing = Some(f);
+                                        match self.clip_drag {
+                                            Some(ClipMarker::Start) => {
+                                                self.clip_start_ms =
+                                                    Some((f * duration as f32) as i64);
+                                            }
+                                            Some(ClipMarker::End) => {
+                                                self.clip_end_ms =
+                                                    Some((f * duration as f32) as i64);
+                                            }
+                                            None => self.scrubbing = Some(f),
+                                        }
                                     }
                                 }
                                 if bar_response.drag_stopped() {
-                                    if let Some(f) = self.scrubbing.take() {
+                                    if self.clip_drag.take().is_some() {
+                                        // Normalising can swap the markers, so
+                                        // only push the result down on release.
+                                        clip_dirty = true;
+                                    } else if let Some(f) = self.scrubbing.take() {
                                         if duration > 0 {
                                             player.seek(f);
                                         }
@@ -1308,6 +1435,11 @@ impl eframe::App for PhotoViewer {
                                 };
                                 let display_frac = self.scrubbing.unwrap_or(played_frac);
 
+                                // Recompute after the drag so the paint below
+                                // reflects this frame's marker positions.
+                                let clip_a = self.clip_start_ms.map(to_frac);
+                                let clip_b = self.clip_end_ms.map(to_frac);
+
                                 let painter = ui.painter();
                                 let rounding = egui::Rounding::same(bar_height * 0.5);
                                 painter.rect_filled(
@@ -1315,6 +1447,23 @@ impl eframe::App for PhotoViewer {
                                     rounding,
                                     egui::Color32::from_rgb(55, 55, 60),
                                 );
+
+                                // Selected clip region, drawn under the
+                                // progress fill so the playhead stays legible.
+                                const CLIP_COLOR: egui::Color32 =
+                                    egui::Color32::from_rgb(255, 186, 72);
+                                if let (Some(a), Some(b)) = (clip_a, clip_b) {
+                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                    let mut band = bar_rect;
+                                    band.min.x = bar_rect.left() + bar_rect.width() * lo;
+                                    band.max.x = bar_rect.left() + bar_rect.width() * hi;
+                                    painter.rect_filled(
+                                        band,
+                                        egui::Rounding::ZERO,
+                                        CLIP_COLOR.gamma_multiply(0.35),
+                                    );
+                                }
+
                                 if display_frac > 0.0 {
                                     let mut filled = bar_rect;
                                     filled.max.x =
@@ -1325,6 +1474,23 @@ impl eframe::App for PhotoViewer {
                                         egui::Color32::from_rgb(100, 200, 255),
                                     );
                                 }
+
+                                // Marker posts, tall enough to grab and drawn
+                                // above the fill so they read as handles
+                                // rather than as progress.
+                                for marker in [clip_a, clip_b].into_iter().flatten() {
+                                    let x = bar_rect.left() + bar_rect.width() * marker;
+                                    let post = egui::Rect::from_center_size(
+                                        egui::pos2(x, bar_rect.center().y),
+                                        egui::vec2(4.0, bar_height + 8.0),
+                                    );
+                                    painter.rect_filled(
+                                        post,
+                                        egui::Rounding::same(2.0),
+                                        CLIP_COLOR,
+                                    );
+                                }
+
                                 let handle_x =
                                     bar_rect.left() + bar_rect.width() * display_frac;
                                 painter.circle_filled(
@@ -1481,11 +1647,13 @@ impl eframe::App for PhotoViewer {
                                         _ => "▶",
                                     };
                                     if ui.button(egui::RichText::new(btn_text).size(16.0)).clicked() {
+                                        let origin_us =
+                                            self.clip_start_ms.unwrap_or(0).max(0) * 1000;
                                         match state {
                                             PlayerState::Playing => player.pause(),
                                             PlayerState::Paused => player.play(),
                                             PlayerState::EndOfFile => {
-                                                player.seek(0.0);
+                                                player.seek_us(origin_us);
                                                 player.play();
                                             }
                                             _ => player.play(),
@@ -1512,9 +1680,96 @@ impl eframe::App for PhotoViewer {
                                             },
                                         ),
                                     );
-                                    if loop_btn.on_hover_text("Toggle loop").clicked() {
+                                    if loop_btn
+                                        .on_hover_text(
+                                            "Toggle loop — also controls whether an \
+                                             A-B clip repeats",
+                                        )
+                                        .clicked()
+                                    {
                                         self.video_looping = !self.video_looping;
                                         player.set_looping(self.video_looping);
+                                    }
+
+                                    // ---- A-B clip loop ----
+                                    let clip_set = self.clip_start_ms.is_some()
+                                        || self.clip_end_ms.is_some();
+                                    let marker_color = |set: bool| {
+                                        if set {
+                                            egui::Color32::from_rgb(255, 186, 72)
+                                        } else {
+                                            egui::Color32::GRAY
+                                        }
+                                    };
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("[")
+                                                .monospace()
+                                                .size(15.0)
+                                                .color(marker_color(
+                                                    self.clip_start_ms.is_some(),
+                                                )),
+                                        )
+                                        .on_hover_text("Set clip start at playhead ( [ )")
+                                        .clicked()
+                                    {
+                                        self.clip_start_ms = Some(elapsed);
+                                        clip_dirty = true;
+                                    }
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("]")
+                                                .monospace()
+                                                .size(15.0)
+                                                .color(marker_color(
+                                                    self.clip_end_ms.is_some(),
+                                                )),
+                                        )
+                                        .on_hover_text("Set clip end at playhead ( ] )")
+                                        .clicked()
+                                    {
+                                        self.clip_end_ms = Some(elapsed);
+                                        clip_dirty = true;
+                                    }
+                                    if clip_set {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("✖")
+                                                    .color(egui::Color32::from_rgb(
+                                                        255, 186, 72,
+                                                    )),
+                                            )
+                                            .on_hover_text("Clear clip loop ( \\ )")
+                                            .clicked()
+                                        {
+                                            self.clip_start_ms = None;
+                                            self.clip_end_ms = None;
+                                            clip_dirty = true;
+                                        }
+                                        // Spell the selection out: the
+                                        // markers on the bar show where it
+                                        // is, not how long it runs.
+                                        let label = match (self.clip_start_ms, self.clip_end_ms) {
+                                            (Some(a), Some(b)) => format!(
+                                                "{} – {}  ({})",
+                                                Self::format_time(a),
+                                                Self::format_time(b),
+                                                Self::format_time((b - a).abs()),
+                                            ),
+                                            (Some(a), None) => {
+                                                format!("{} – end?", Self::format_time(a))
+                                            }
+                                            (None, Some(b)) => {
+                                                format!("start? – {}", Self::format_time(b))
+                                            }
+                                            (None, None) => String::new(),
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .color(egui::Color32::from_rgb(255, 186, 72))
+                                                .monospace()
+                                                .size(11.0),
+                                        );
                                     }
 
                                     // Right-side cluster: fullscreen on the far right,
@@ -1608,6 +1863,9 @@ impl eframe::App for PhotoViewer {
                     // Request continuous repaint for video playback
                     ctx.request_repaint();
                 }
+                if clip_dirty {
+                    self.commit_clip_range();
+                }
             } else {
                 // Image rendering (original logic)
                 let response = ui.interact(rect, ui.id().with("pan_drag"), egui::Sense::drag());
@@ -1649,8 +1907,10 @@ impl eframe::App for PhotoViewer {
                                  Images: Space / Right Arrow = Next  |  Left Arrow = Prev  |  +/- Zoom\n\
                                  Videos: Left/Right Arrow = Seek 3s  |  Ctrl + Left/Right = Prev/Next\n\
                                  Videos: , / . = Step back / forward one frame (auto-pauses)\n\
+                                 Videos: [ / ] = Set clip start / end  |  \\ = Clear clip loop\n\
                                  Space: Play/Pause (video)  |  Next (image)\n\
                                  Up/Down: Volume ±2%  |  Click 🔊 to mute / unmute\n\
+                                 Delete: Move current file to the Recycle Bin\n\
                                  Scroll to Zoom  |  Drag to Pan  |  0: Reset View\n\
                                  F11: Fullscreen  |  M: Filter  |  R: Random / Ordered\n\
                                  Double-tap Esc: Close",
@@ -1722,6 +1982,9 @@ impl eframe::App for PhotoViewer {
             // floating playback panel so the rotate / explorer
             // buttons don't get hidden underneath it.
             if self.current_media_path.is_some() {
+                // `delete_current_media` needs `&mut self`, which the
+                // window closure below is already holding.
+                let mut delete_requested = false;
                 let controls_offset_y = if self.is_video { -128.0 } else { -10.0 };
                 egui::Window::new("Controls")
                     .anchor(
@@ -1760,7 +2023,57 @@ impl eframe::App for PhotoViewer {
                         if ui.button("📂 Show in Explorer").clicked() {
                             self.open_in_explorer();
                         }
+                        if ui
+                            .button(
+                                egui::RichText::new("🗑 Delete")
+                                    .color(egui::Color32::from_rgb(255, 140, 140)),
+                            )
+                            .on_hover_text("Move to Recycle Bin (Delete)")
+                            .clicked()
+                        {
+                            delete_requested = true;
+                        }
                     });
+                if delete_requested {
+                    self.delete_current_media(ctx);
+                }
+            }
+
+            // Transient status message (deletes, clip markers). Drawn
+            // last so it sits above the video and both control panels.
+            if let Some(toast) = &self.toast {
+                if toast.expired() {
+                    self.toast = None;
+                } else {
+                    let (fill, text_color) = if toast.is_error {
+                        (
+                            egui::Color32::from_rgb(120, 30, 30),
+                            egui::Color32::from_rgb(255, 225, 225),
+                        )
+                    } else {
+                        (egui::Color32::from_black_alpha(225), egui::Color32::WHITE)
+                    };
+                    egui::Area::new(egui::Id::new("StatusToast"))
+                        .anchor(egui::Align2::CENTER_TOP, [0.0, 24.0])
+                        .order(egui::Order::Tooltip)
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            egui::Frame::none()
+                                .fill(fill)
+                                .rounding(10.0)
+                                .inner_margin(egui::Margin::symmetric(16.0, 9.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&toast.text)
+                                            .color(text_color)
+                                            .size(15.0),
+                                    );
+                                });
+                        });
+                    // Toasts time out on their own, so keep frames
+                    // coming until this one is gone.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
             }
         });
 
