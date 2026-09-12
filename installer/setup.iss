@@ -32,7 +32,6 @@ Name: "associatevideos"; Description: "Associate video files (mp4, mkv, avi, mov
 
 [Files]
 Source: "..\target\release\fast-photo-viewer.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\SDL2.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dlls\avcodec-61.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dlls\avdevice-61.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dlls\avfilter-10.dll"; DestDir: "{app}"; Flags: ignoreversion

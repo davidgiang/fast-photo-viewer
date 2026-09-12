@@ -98,7 +98,6 @@ jobs:
           set -euo pipefail
           mkdir -p dlls
           cp ffmpeg7/bin/*.dll dlls/
-          cp target/release/SDL2.dll dlls/
 
       - name: Install Inno Setup
         shell: powershell
