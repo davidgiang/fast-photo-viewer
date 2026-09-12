@@ -22,6 +22,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # BtbN rotates assets off the rolling `latest` release, so pin an immutable
+  # autobuild tag. ffmpeg-the-third 2.0 only binds libavcodec <= 61 (FFmpeg 7.1)
+  # -- do NOT bump this to 8.x/9.x without upgrading the crate first.
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
+  FFMPEG_ASSET: ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1.zip
 
 jobs:
   build:
@@ -73,20 +78,26 @@ jobs:
       - name: Download FFmpeg shared build
         shell: bash
         run: |
-          curl -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
-          unzip -q ffmpeg.zip -d ffmpeg7
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 5 -o ffmpeg.zip \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_ASSET}"
+          unzip -q ffmpeg.zip -d ffmpeg7-raw
+          # Archive contains a single versioned top-level dir; normalise the name
+          # so later steps never have to hardcode the build hash.
+          mv ffmpeg7-raw/*/ ffmpeg7
+          test -d ffmpeg7/bin || { echo "::error::unexpected FFmpeg archive layout"; ls -R ffmpeg7 | head -20; exit 1; }
+          echo "FFMPEG_DIR=${GITHUB_WORKSPACE}/ffmpeg7" >> "$GITHUB_ENV"
 
       - name: Build release binary
         shell: bash
-        run: |
-          export FFMPEG_DIR="${GITHUB_WORKSPACE}/ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1"
-          cargo build --release
+        run: cargo build --release
 
       - name: Stage DLLs for installer
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dlls
-          cp ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin/*.dll dlls/
+          cp ffmpeg7/bin/*.dll dlls/
           cp target/release/SDL2.dll dlls/
 
       - name: Install Inno Setup
