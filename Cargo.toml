@@ -1,6 +1,6 @@
 [package]
 name = "fast-photo-viewer"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "A fast, lightweight photo and video viewer"
 repository = "https://github.com/davidgiang1/fast-photo-viewer"
