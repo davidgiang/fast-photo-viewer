@@ -117,7 +117,7 @@ fn main() {
             if images_only {
                 media::is_image_file(p)
             } else if videos_only {
-                media::is_video_file(p)
+                media::is_playable_file(p)
             } else {
                 true
             }
@@ -158,7 +158,7 @@ fn main() {
             let _ = f.flush();
         }
 
-        let outcome = if media::is_video_file(path) {
+        let outcome = if media::is_playable_file(path) {
             probe_video(path, harness.as_mut())
         } else {
             probe_image(path, harness.as_mut())

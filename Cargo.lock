@@ -1564,6 +1564,7 @@ dependencies = [
  "ffmpeg-the-third",
  "image 0.25.9",
  "imagepipe",
+ "naga",
  "pollster 0.3.0",
  "rand 0.8.5",
  "rawloader",

@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod filter;
+mod index_cache;
 mod media;
 mod recycle;
 mod video_player;
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::process::Command;
@@ -14,36 +18,13 @@ use walkdir::WalkDir;
 use rand::seq::SliceRandom;
 use image::DynamicImage;
 use crate::media::{
-    decode_image, is_image_file, is_supported_file, is_video_file, IMAGE_EXTENSIONS,
-    VIDEO_EXTENSIONS,
+    decode_image, is_image_file, is_playable_file, is_supported_file, AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS, VIDEO_EXTENSIONS,
 };
+use crate::filter::{probe_meta, AudioTrack, MediaFilter, MediaMeta, Orientation, RESOLUTION_STEPS};
+use crate::index_cache::{DiskIndex, FileStamp};
 use crate::video_player::{Player, PlayerState};
 use ffmpeg_the_third as ffmpeg;
-
-#[derive(Clone, Copy, PartialEq)]
-enum MediaFilter {
-    All,
-    ImagesOnly,
-    VideosOnly,
-}
-
-impl MediaFilter {
-    fn label(self) -> &'static str {
-        match self {
-            MediaFilter::All => "All Media",
-            MediaFilter::ImagesOnly => "Images Only",
-            MediaFilter::VideosOnly => "Videos Only",
-        }
-    }
-
-    fn cycle(self) -> Self {
-        match self {
-            MediaFilter::All => MediaFilter::ImagesOnly,
-            MediaFilter::ImagesOnly => MediaFilter::VideosOnly,
-            MediaFilter::VideosOnly => MediaFilter::All,
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewOrder {
@@ -100,13 +81,43 @@ impl Toast {
     }
 }
 
-fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
-    match filter {
-        MediaFilter::All => true,
-        MediaFilter::ImagesOnly => is_image_file(path),
-        MediaFilter::VideosOnly => is_video_file(path),
+/// The texture for the image on screen, plus handles that were swapped
+/// out and must outlive the frame they were swapped in.
+///
+/// egui_wgpu destroys a freed texture *before* submitting the frame. A
+/// handle dropped after something already painted it this frame (rotate,
+/// delete and navigation all run after the central panel) therefore
+/// crashes wgpu with "texture has been destroyed". Retiring the handle
+/// defers the free to the next frame, which no longer paints it.
+#[derive(Default)]
+struct TextureSlot {
+    current: Option<egui::TextureHandle>,
+    retired: Vec<egui::TextureHandle>,
+}
+
+impl TextureSlot {
+    fn current(&self) -> Option<&egui::TextureHandle> {
+        self.current.as_ref()
+    }
+
+    fn replace(&mut self, new: Option<egui::TextureHandle>) {
+        if let Some(old) = std::mem::replace(&mut self.current, new) {
+            self.retired.push(old);
+        }
+    }
+
+    /// Keep a handle alive until `release_retired`.
+    fn retire(&mut self, handle: egui::TextureHandle) {
+        self.retired.push(handle);
+    }
+
+    /// Call at the start of a frame: nothing painted last frame is
+    /// still waiting to be submitted.
+    fn release_retired(&mut self) {
+        self.retired.clear();
     }
 }
+
 
 // `file_has_audio_stream` was used by the old egui-video path; the in-
 // house player now owns audio probing internally.
@@ -318,6 +329,9 @@ struct PhotoViewer {
     // Video
     video_player: Option<Player>,
     is_video: bool,
+    /// The loaded playable has sound but no picture (an .mp3, .m4a, or
+    /// an .mp4 with only a soundtrack). Only meaningful while `is_video`.
+    is_audio_only: bool,
     video_looping: bool,
     video_volume: f32,
     /// Remembers the volume level before the user muted so clicking
@@ -360,11 +374,25 @@ struct PhotoViewer {
 
     // Filter
     media_filter: MediaFilter,
+    /// What background indexing has learned about each file (`None`: it
+    /// could not be read). Only filled while the active filter needs it.
+    meta_cache: Arc<Mutex<HashMap<PathBuf, Option<MediaMeta>>>>,
+    /// Bumped whenever the file list is replaced, so a running indexer
+    /// stops instead of filling the cache with the old folder.
+    index_gen: Arc<AtomicU64>,
+    indexer_running: Arc<AtomicBool>,
+    /// True while the active filter needs file details; the indexer then
+    /// works at full speed instead of staying out of the way.
+    index_urgent: Arc<AtomicBool>,
+    /// Remembers file details between runs, keyed by size and mtime, so a
+    /// file is only ever reopened if it has changed.
+    disk_index: Arc<Mutex<DiskIndex>>,
+    filter_window_open: bool,
     view_order: ViewOrder,
 
     is_scanning: Arc<Mutex<bool>>,
     scan_count: Arc<Mutex<usize>>,
-    texture: Option<egui::TextureHandle>,
+    texture: TextureSlot,
     error_msg: Option<String>,
     pending_initial_file: Option<PathBuf>,
     wgpu_backend: Option<video_player::WgpuBackend>,
@@ -395,6 +423,7 @@ impl PhotoViewer {
             current_image: None,
             video_player: None,
             is_video: false,
+            is_audio_only: false,
             video_looping: true,
             video_volume: 0.10,
             video_pre_mute_volume: 0.10,
@@ -413,13 +442,23 @@ impl PhotoViewer {
             history_index: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
-            media_filter: MediaFilter::All,
+            media_filter: MediaFilter::all(),
+            meta_cache: Arc::new(Mutex::new(HashMap::new())),
+            index_gen: Arc::new(AtomicU64::new(0)),
+            indexer_running: Arc::new(AtomicBool::new(false)),
+            index_urgent: Arc::new(AtomicBool::new(false)),
+            disk_index: Arc::new(Mutex::new(
+                index_cache::default_path()
+                    .map(|p| DiskIndex::load_from(&p))
+                    .unwrap_or_default(),
+            )),
+            filter_window_open: false,
             view_order: ViewOrder::Random,
             wgpu_backend,
             frame_interval_secs: 1.0 / 60.0,
             is_scanning: Arc::new(Mutex::new(false)),
             scan_count: Arc::new(Mutex::new(0)),
-            texture: None,
+            texture: TextureSlot::default(),
             error_msg: None,
             pending_initial_file: initial_file,
         }
@@ -434,6 +473,7 @@ impl PhotoViewer {
     fn open_file_dialog(&mut self, ctx: &egui::Context) {
         let all_extensions: Vec<&str> = IMAGE_EXTENSIONS.iter()
             .chain(VIDEO_EXTENSIONS.iter())
+            .chain(AUDIO_EXTENSIONS.iter())
             .copied()
             .collect();
 
@@ -441,6 +481,7 @@ impl PhotoViewer {
             .add_filter("Media", &all_extensions)
             .add_filter("Images", IMAGE_EXTENSIONS)
             .add_filter("Videos", VIDEO_EXTENSIONS)
+            .add_filter("Audio", AUDIO_EXTENSIONS)
             .pick_file()
         {
             if let Some(parent) = path.parent() {
@@ -454,15 +495,279 @@ impl PhotoViewer {
         }
     }
 
+    fn matches_filter(&self, path: &Path) -> bool {
+        let cache = self.meta_cache.lock().unwrap();
+        self.media_filter
+            .matches(path, cache.get(path).and_then(|m| m.as_ref()))
+    }
+
+    /// (files indexed, files in the list).
+    fn index_progress(&self) -> Option<(usize, usize)> {
+        let total = self.media_paths.lock().unwrap().len();
+        let done = self.meta_cache.lock().unwrap().len().min(total);
+        Some((done, total))
+    }
+
+    /// Keep file details up to date in the background. This runs for every
+    /// folder, not just when a filter needs it, so the answers are ready
+    /// before the first filter is applied. It works gently until a filter
+    /// actually depends on the results.
+    fn ensure_indexing(&self, ctx: &egui::Context) {
+        if self.indexer_running.load(AtomicOrdering::SeqCst) {
+            return;
+        }
+        match self.index_progress() {
+            Some((done, total)) if done < total => {}
+            _ => return,
+        }
+        self.indexer_running.store(true, AtomicOrdering::SeqCst);
+
+        let paths = self.media_paths.clone();
+        let cache = self.meta_cache.clone();
+        let disk = self.disk_index.clone();
+        let index_path = index_cache::default_path();
+        let generation = self.index_gen.clone();
+        let my_gen = generation.load(AtomicOrdering::SeqCst);
+        let running = self.indexer_running.clone();
+        let urgent = self.index_urgent.clone();
+        let ctx = ctx.clone();
+        let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        thread::spawn(move || {
+            const BATCH: usize = 512;
+            const SAVE_EVERY: usize = 2000;
+            let save = |disk: &Arc<Mutex<DiskIndex>>| {
+                if let (Some(path), Ok(mut disk)) = (index_path.as_ref(), disk.lock()) {
+                    if disk.unsaved() > 0 {
+                        let _ = disk.save_to(path);
+                    }
+                }
+            };
+            while generation.load(AtomicOrdering::SeqCst) == my_gen {
+                // Lock order matches the readers: paths, then cache.
+                let todo: Vec<PathBuf> = {
+                    let paths = paths.lock().unwrap();
+                    let cache = cache.lock().unwrap();
+                    paths
+                        .iter()
+                        .filter(|p| !cache.contains_key(*p))
+                        .take(BATCH)
+                        .cloned()
+                        .collect()
+                };
+                if todo.is_empty() {
+                    break;
+                }
+
+                // Taken before reading the file, so a file modified while
+                // it is being read is simply re-read next time.
+                let stamped: Vec<(PathBuf, Option<FileStamp>)> = todo
+                    .into_iter()
+                    .map(|p| {
+                        let stamp = FileStamp::of(&p);
+                        (p, stamp)
+                    })
+                    .collect();
+
+                // Whatever the saved index already knows costs nothing.
+                let (mut results, misses) = disk.lock().unwrap().split_known(stamped);
+
+                // Only genuinely new or changed files are opened.
+                let urgent_now = urgent.load(AtomicOrdering::Relaxed);
+                if !misses.is_empty() {
+                    let workers = index_cache::worker_count(cores, urgent_now);
+                    let chunk = misses.len().div_ceil(workers);
+                    let probed: Vec<(PathBuf, Option<FileStamp>, Option<MediaMeta>)> =
+                        thread::scope(|scope| {
+                            let handles: Vec<_> = misses
+                                .chunks(chunk)
+                                .map(|files| {
+                                    scope.spawn(move || {
+                                        files
+                                            .iter()
+                                            .map(|(p, stamp)| {
+                                                // A decoder bug on one odd file must
+                                                // not stall indexing of the rest.
+                                                let meta = std::panic::catch_unwind(
+                                                    std::panic::AssertUnwindSafe(|| probe_meta(p)),
+                                                )
+                                                .unwrap_or(None);
+                                                (p.clone(), *stamp, meta)
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .flat_map(|h| h.join().unwrap_or_default())
+                                .collect()
+                        });
+                    let mut store = disk.lock().unwrap();
+                    for (path, stamp, meta) in probed {
+                        if let Some(stamp) = stamp {
+                            store.insert(path.clone(), stamp, meta.clone());
+                        }
+                        results.push((path, meta));
+                    }
+                    let needs_save = store.unsaved() >= SAVE_EVERY;
+                    drop(store);
+                    if needs_save {
+                        save(&disk);
+                    }
+                }
+
+                let mut cache = cache.lock().unwrap();
+                if generation.load(AtomicOrdering::SeqCst) != my_gen {
+                    break;
+                }
+                cache.extend(results);
+                drop(cache);
+                ctx.request_repaint();
+                if !urgent_now {
+                    // Nobody is waiting on this yet; leave the disk and
+                    // the UI thread room to breathe.
+                    thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            save(&disk);
+            running.store(false, AtomicOrdering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
+    fn show_filter_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.filter_window_open;
+        let mut f = self.media_filter.clone();
+        egui::Window::new("Filters")
+            .open(&mut open)
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_TOP, [10.0, 60.0])
+            .show(ctx, |ui| {
+                ui.strong("Show");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut f.images, "Images");
+                    ui.checkbox(&mut f.videos, "Video");
+                    ui.checkbox(&mut f.audio, "Audio");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Quick:");
+                    for (name, preset) in [
+                        ("All", MediaFilter::all()),
+                        ("Images", MediaFilter::images_only()),
+                        ("Video", MediaFilter::videos_only()),
+                        ("Audio", MediaFilter::audio_only()),
+                    ] {
+                        if ui.small_button(name).clicked() {
+                            f.images = preset.images;
+                            f.videos = preset.videos;
+                            f.audio = preset.audio;
+                        }
+                    }
+                });
+                ui.separator();
+
+                ui.strong("Length");
+                ui.horizontal(|ui| {
+                    ui.label("Min");
+                    ui.add(egui::DragValue::new(&mut f.min_duration_s).range(0..=86_400).suffix(" s"));
+                    ui.label("Max");
+                    ui.add(egui::DragValue::new(&mut f.max_duration_s).range(0..=86_400).suffix(" s"));
+                });
+                ui.weak("0 = no limit. Applies to video and audio; images have no length.");
+                if f.max_duration_s > 0 && f.max_duration_s < f.min_duration_s {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Max is below min: nothing can match.");
+                }
+                ui.separator();
+
+                ui.strong("Resolution (shorter side)");
+                let res_label = |v: u32| {
+                    RESOLUTION_STEPS
+                        .iter()
+                        .find(|(s, _)| *s == v)
+                        .map(|(_, l)| l.to_string())
+                        .unwrap_or_else(|| format!("{} px", v))
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Min");
+                    egui::ComboBox::from_id_salt("filter_min_res")
+                        .selected_text(res_label(f.min_short_side))
+                        .show_ui(ui, |ui| {
+                            for (v, l) in RESOLUTION_STEPS {
+                                ui.selectable_value(&mut f.min_short_side, *v, *l);
+                            }
+                        });
+                    ui.label("Max");
+                    egui::ComboBox::from_id_salt("filter_max_res")
+                        .selected_text(res_label(f.max_short_side))
+                        .show_ui(ui, |ui| {
+                            for (v, l) in RESOLUTION_STEPS {
+                                ui.selectable_value(&mut f.max_short_side, *v, *l);
+                            }
+                        });
+                });
+                ui.weak("Applies to images and video; audio has no picture.");
+                ui.separator();
+
+                ui.strong("Shape");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut f.orientation, Orientation::Any, "Any");
+                    ui.radio_value(&mut f.orientation, Orientation::Landscape, "Horizontal");
+                    ui.radio_value(&mut f.orientation, Orientation::Portrait, "Vertical");
+                    ui.radio_value(&mut f.orientation, Orientation::Square, "Square");
+                });
+                ui.weak("Applies to images and video, judged by the size as displayed.");
+                ui.separator();
+
+                ui.strong("Sound");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut f.audio_track, AudioTrack::Any, "Any");
+                    ui.radio_value(&mut f.audio_track, AudioTrack::With, "Has audio");
+                    ui.radio_value(&mut f.audio_track, AudioTrack::Without, "Silent video");
+                });
+                ui.separator();
+
+                let (matching, total) = {
+                    let paths = self.media_paths.lock().unwrap();
+                    let cache = self.meta_cache.lock().unwrap();
+                    let matching = paths
+                        .iter()
+                        .filter(|p| f.matches(p, cache.get(*p).and_then(|m| m.as_ref())))
+                        .count();
+                    (matching, paths.len())
+                };
+                ui.label(format!("{} of {} files match", matching, total));
+                if f.needs_index() {
+                    if let Some((done, total)) = self.index_progress() {
+                        if done < total {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Reading file details... {}/{}", done, total));
+                            });
+                        }
+                    }
+                }
+                if ui.button("Reset filters").clicked() {
+                    f = MediaFilter::all();
+                }
+            });
+        // An empty selection would leave nothing to show, so it is refused.
+        if f.images || f.videos || f.audio {
+            self.media_filter = f;
+        }
+        self.filter_window_open = open;
+    }
+
     fn start_scan(&mut self, directory: PathBuf) {
         {
             let mut paths = self.media_paths.lock().unwrap();
             paths.clear();
         }
+        self.index_gen.fetch_add(1, AtomicOrdering::SeqCst);
+        self.meta_cache.lock().unwrap().clear();
         self.history.clear();
         self.history_index = None;
         self.current_media_path = None;
-        self.texture = None;
+        self.texture.replace(None);
         self.video_player = None;
         self.is_video = false;
         self.reset_view();
@@ -504,7 +809,7 @@ impl PhotoViewer {
             // Look forward through history for a matching entry
             let mut next_idx = idx + 1;
             while next_idx < self.history.len() {
-                if matches_filter(&self.history[next_idx], self.media_filter) {
+                if self.matches_filter(&self.history[next_idx]) {
                     self.history_index = Some(next_idx);
                     let path = self.history[next_idx].clone();
                     self.current_media_path = Some(path.clone());
@@ -527,7 +832,7 @@ impl PhotoViewer {
             let mut prev_idx = idx;
             while prev_idx > 0 {
                 prev_idx -= 1;
-                if matches_filter(&self.history[prev_idx], self.media_filter) {
+                if self.matches_filter(&self.history[prev_idx]) {
                     self.history_index = Some(prev_idx);
                     let path = self.history[prev_idx].clone();
                     self.current_media_path = Some(path.clone());
@@ -559,7 +864,7 @@ impl PhotoViewer {
             let mut found = None;
             for step in 1..=n {
                 let idx = ((start + delta * step as isize).rem_euclid(n as isize)) as usize;
-                if matches_filter(&paths[idx], self.media_filter) {
+                if self.matches_filter(&paths[idx]) {
                     found = Some(paths[idx].clone());
                     break;
                 }
@@ -585,7 +890,7 @@ impl PhotoViewer {
 
             // Filter by media type AND exclude already-seen files
             let available: Vec<&PathBuf> = paths.iter()
-                .filter(|p| matches_filter(p, self.media_filter) && !history_set.contains(p))
+                .filter(|p| self.matches_filter(p) && !history_set.contains(p))
                 .collect();
 
             let mut rng = rand::thread_rng();
@@ -595,14 +900,14 @@ impl PhotoViewer {
             } else {
                 // All matching files seen — pick any matching file except the current one
                 let matching: Vec<&PathBuf> = paths.iter()
-                    .filter(|p| matches_filter(p, self.media_filter) && Some(*p) != self.current_media_path.as_ref())
+                    .filter(|p| self.matches_filter(p) && Some(*p) != self.current_media_path.as_ref())
                     .collect();
                 if !matching.is_empty() {
                     matching.choose(&mut rng).map(|p| (*p).clone())
                 } else {
                     // Only one matching file (or none)
                     paths.iter()
-                        .find(|p| matches_filter(p, self.media_filter))
+                        .find(|p| self.matches_filter(p))
                         .cloned()
                 }
             }
@@ -784,6 +1089,7 @@ impl PhotoViewer {
         };
         *self.scan_count.lock().unwrap() = remaining;
 
+        self.meta_cache.lock().unwrap().remove(path);
         self.history.retain(|p| p != path);
         if self.history.is_empty() {
             self.history_index = None;
@@ -802,13 +1108,13 @@ impl PhotoViewer {
             let paths = self.media_paths.lock().unwrap();
             paths
                 .iter()
-                .find(|p| p.as_path() > deleted && matches_filter(p, self.media_filter))
-                .or_else(|| paths.iter().rev().find(|p| matches_filter(p, self.media_filter)))
+                .find(|p| p.as_path() > deleted && self.matches_filter(p))
+                .or_else(|| paths.iter().rev().find(|p| self.matches_filter(p)))
                 .cloned()
         };
 
         self.current_media_path = None;
-        self.texture = None;
+        self.texture.replace(None);
         self.current_image = None;
         self.clear_clip_range();
         self.reset_view();
@@ -847,7 +1153,7 @@ impl PhotoViewer {
         self.clip_start_ms = None;
         self.clip_end_ms = None;
         self.clip_drag = None;
-        if is_video_file(&path) {
+        if is_playable_file(&path) {
             self.load_video(path, ctx);
         } else {
             self.load_image(path, ctx);
@@ -857,32 +1163,36 @@ impl PhotoViewer {
     fn load_video(&mut self, path: PathBuf, ctx: &egui::Context) {
         // Clear image state
         self.current_image = None;
-        self.texture = None;
+        self.texture.replace(None);
 
         // Reset any in-flight scrub and preview thumbnails.
         self.scrubbing = None;
-        self.seek_thumb_textures.clear();
+        for handle in self.seek_thumb_textures.drain(..).flatten() {
+            self.texture.retire(handle);
+        }
         const THUMB_COUNT: usize = 20;
         {
             let mut thumbs = self.seek_thumbs.lock().unwrap();
             *thumbs = vec![None; THUMB_COUNT];
         }
         self.seek_thumb_textures.resize_with(THUMB_COUNT, || None);
-        {
-            let path_clone = path.clone();
-            let thumbs_clone = self.seek_thumbs.clone();
-            let ctx_clone = ctx.clone();
-            thread::spawn(move || {
-                extract_seek_thumbnails(path_clone, THUMB_COUNT, thumbs_clone, ctx_clone);
-            });
-        }
-
         match Player::open_with_backend(ctx, &path, self.wgpu_backend.clone()) {
             Ok(mut player) => {
                 player.set_looping(self.video_looping);
                 player.set_volume(self.video_volume);
                 player.play();
                 self.video_has_audio = player.has_audio();
+                self.is_audio_only = !player.has_video();
+                // Seek-bar previews are frames from the picture; a file
+                // with no picture has none to extract.
+                if !self.is_audio_only {
+                    let path_clone = path.clone();
+                    let thumbs_clone = self.seek_thumbs.clone();
+                    let ctx_clone = ctx.clone();
+                    thread::spawn(move || {
+                        extract_seek_thumbnails(path_clone, THUMB_COUNT, thumbs_clone, ctx_clone);
+                    });
+                }
                 self.video_player = Some(player);
                 self.is_video = true;
                 self.seek_frac = 0.0;
@@ -916,7 +1226,7 @@ impl PhotoViewer {
                 println!("{}", msg);
                 self.error_msg = Some(msg);
                 self.current_image = None;
-                self.texture = None;
+                self.texture.replace(None);
             }
         }
     }
@@ -948,11 +1258,12 @@ impl PhotoViewer {
                 pixels.as_slice(),
             );
 
-            self.texture = Some(ctx.load_texture(
+            let texture = ctx.load_texture(
                 "current_image",
                 color_image,
                 egui::TextureOptions::LINEAR,
-            ));
+            );
+            self.texture.replace(Some(texture));
         }
     }
 
@@ -986,12 +1297,7 @@ impl PhotoViewer {
     /// Render a video frame with rotation using a custom textured mesh.
     fn render_rotated_video(ui: &mut egui::Ui, texture_id: egui::TextureId, rect: egui::Rect, rotation: u16) {
         // UV coordinates for each rotation (top-left, top-right, bottom-right, bottom-left)
-        let uvs: [(f32, f32); 4] = match rotation {
-            90  => [(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
-            180 => [(1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (1.0, 0.0)],
-            270 => [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
-            _   => [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
-        };
+        let uvs = video_player::rotated_corner_uvs(rotation);
 
         let white = egui::Color32::WHITE;
         let mut mesh = egui::Mesh::with_texture(texture_id);
@@ -1006,6 +1312,10 @@ impl PhotoViewer {
 
 impl eframe::App for PhotoViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Anything retired last frame is no longer referenced by a
+        // pending paint, so it is safe to free now.
+        self.texture.release_retired();
+
         // Handle deferred initial file loading (first frame only)
         if let Some(path) = self.pending_initial_file.take() {
             if path.exists() && path.is_file() {
@@ -1157,7 +1467,10 @@ impl eframe::App for PhotoViewer {
         }
 
         // M: cycle media filter
-        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+        // Shift+M: open the advanced filter window
+        if ctx.input(|i| i.key_pressed(egui::Key::M) && i.modifiers.shift) {
+            self.filter_window_open = !self.filter_window_open;
+        } else if ctx.input(|i| i.key_pressed(egui::Key::M)) {
             self.media_filter = self.media_filter.cycle();
         }
 
@@ -1189,6 +1502,13 @@ impl eframe::App for PhotoViewer {
                 self.zoom *= 0.87;
                 self.zoom = self.zoom.clamp(0.1, 50.0);
             }
+        }
+
+        self.index_urgent
+            .store(self.media_filter.needs_index(), AtomicOrdering::Relaxed);
+        self.ensure_indexing(ctx);
+        if self.filter_window_open {
+            self.show_filter_window(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1271,6 +1591,7 @@ impl eframe::App for PhotoViewer {
                             video_rect,
                             screen_rect.size(),
                             ctx.pixels_per_point(),
+                            self.video_rotation,
                         );
                     }
 
@@ -1279,8 +1600,8 @@ impl eframe::App for PhotoViewer {
                     if player.is_nv12_path() {
                         // Partial Phase E: custom wgpu pipeline that
                         // samples Y + UV and does YUV→RGB in the
-                        // fragment shader. Rotation is not yet
-                        // supported on this path.
+                        // fragment shader; rotation is applied to the
+                        // quad's texture coordinates in the vertex shader.
                         if let Some(cb) = player.nv12_paint_callback(video_rect) {
                             ui.painter().add(egui::Shape::Callback(cb));
                         }
@@ -1295,6 +1616,31 @@ impl eframe::App for PhotoViewer {
                         } else {
                             Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
                         }
+                    }
+
+                    if self.is_audio_only {
+                        let painter = ui.painter();
+                        let center = video_rect.center();
+                        painter.text(
+                            center - egui::vec2(0.0, 24.0),
+                            egui::Align2::CENTER_CENTER,
+                            "🎵",
+                            egui::FontId::proportional(72.0),
+                            egui::Color32::from_gray(150),
+                        );
+                        let name = self
+                            .current_media_path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        painter.text(
+                            center + egui::vec2(0.0, 40.0),
+                            egui::Align2::CENTER_CENTER,
+                            name,
+                            egui::FontId::proportional(20.0),
+                            egui::Color32::from_gray(200),
+                        );
                     }
 
                     // Floating controls panel: centered, rounded, not full
@@ -1873,7 +2219,7 @@ impl eframe::App for PhotoViewer {
                     self.pan += response.drag_delta();
                 }
 
-                if let Some(texture) = &self.texture {
+                if let Some(texture) = self.texture.current() {
                     let available_size = rect.size();
                     let original_size = texture.size_vec2();
 
@@ -1942,6 +2288,11 @@ impl eframe::App for PhotoViewer {
                             ctx.request_repaint();
                         } else {
                             ui.label(format!("Total: {} media files", count));
+                            if let Some((done, total)) = self.index_progress() {
+                                if done < total {
+                                    ui.weak(format!("Preparing filters... {}/{}", done, total));
+                                }
+                            }
                             if let Some(path) = &self.current_media_path {
                                 ui.label(
                                     path.file_name()
@@ -1949,7 +2300,7 @@ impl eframe::App for PhotoViewer {
                                         .to_string_lossy(),
                                 );
                                 if self.is_video {
-                                    ui.label("(Video)");
+                                    ui.label(if self.is_audio_only { "(Audio)" } else { "(Video)" });
                                 }
                                 if let Some(idx) = self.history_index {
                                     ui.label(format!(
@@ -1961,7 +2312,7 @@ impl eframe::App for PhotoViewer {
                             }
                         }
                         // Show active filter
-                        if self.media_filter != MediaFilter::All {
+                        if !self.media_filter.is_default() {
                             ui.colored_label(
                                 egui::Color32::from_rgb(100, 200, 255),
                                 format!("Filter: {}", self.media_filter.label()),
@@ -1971,6 +2322,9 @@ impl eframe::App for PhotoViewer {
                             egui::Color32::from_rgb(100, 200, 255),
                             format!("Order: {}", self.view_order.label()),
                         );
+                        if ui.button("Filters (Shift+M)").clicked() {
+                            self.filter_window_open = !self.filter_window_open;
+                        }
                         if let Some(err) = &self.error_msg {
                             ui.colored_label(egui::Color32::RED, err);
                         }
@@ -1996,6 +2350,8 @@ impl eframe::App for PhotoViewer {
                     .auto_sized()
                     .frame(egui::Frame::popup(ui.style()).multiply_with_opacity(0.8))
                     .show(ctx, |ui| {
+                        // Nothing to rotate on an audio-only file.
+                        if !(self.is_video && self.is_audio_only) {
                         ui.horizontal(|ui| {
                             if ui
                                 .button("⟲")
@@ -2020,6 +2376,7 @@ impl eframe::App for PhotoViewer {
                                 }
                             }
                         });
+                        }
                         if ui.button("📂 Show in Explorer").clicked() {
                             self.open_in_explorer();
                         }
@@ -2089,4 +2446,103 @@ impl eframe::App for PhotoViewer {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run one headless egui frame, doing `work` inside it, and report
+    /// which textures egui scheduled to be freed at the end of it.
+    fn frame_frees(ctx: &egui::Context, work: impl FnOnce()) -> Vec<egui::TextureId> {
+        let mut work = Some(work);
+        let out = ctx.run(egui::RawInput::default(), |_| {
+            if let Some(w) = work.take() {
+                w();
+            }
+        });
+        out.textures_delta.free
+    }
+
+    fn tiny_texture(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
+        ctx.load_texture(
+            name,
+            egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        )
+    }
+
+    /// The crash this guards against: dropping the displayed texture in the
+    /// same frame that painted it. egui_wgpu destroys freed textures before
+    /// submitting, so wgpu aborts with "texture has been destroyed".
+    #[test]
+    fn dropping_a_handle_frees_its_texture_in_that_same_frame() {
+        let ctx = egui::Context::default();
+        let handle = tiny_texture(&ctx, "plain");
+        let id = handle.id();
+        let freed = frame_frees(&ctx, move || drop(handle));
+        assert!(freed.contains(&id), "baseline: a plain drop schedules the free");
+    }
+
+    #[test]
+    fn replacing_the_texture_defers_the_free_to_the_next_frame() {
+        let ctx = egui::Context::default();
+        let mut slot = TextureSlot::default();
+        let first = tiny_texture(&ctx, "first");
+        let first_id = first.id();
+        slot.replace(Some(first));
+        let _ = frame_frees(&ctx, || {});
+
+        // Frame N: the old texture has been painted; rotate swaps it.
+        let second = tiny_texture(&ctx, "second");
+        let second_id = second.id();
+        let freed = frame_frees(&ctx, || slot.replace(Some(second)));
+        assert!(
+            !freed.contains(&first_id),
+            "the old texture must survive the frame that painted it"
+        );
+        assert_eq!(slot.current().map(|t| t.id()), Some(second_id));
+
+        // Frame N+1: nothing references it any more.
+        let freed = frame_frees(&ctx, || slot.release_retired());
+        assert!(freed.contains(&first_id), "and is released one frame later");
+        assert!(!freed.contains(&second_id), "the live texture is untouched");
+    }
+
+    #[test]
+    fn clearing_the_texture_on_delete_is_also_deferred() {
+        let ctx = egui::Context::default();
+        let mut slot = TextureSlot::default();
+        let handle = tiny_texture(&ctx, "shown");
+        let id = handle.id();
+        slot.replace(Some(handle));
+        let _ = frame_frees(&ctx, || {});
+
+        let freed = frame_frees(&ctx, || slot.replace(None));
+        assert!(!freed.contains(&id));
+        assert!(slot.current().is_none());
+        let freed = frame_frees(&ctx, || slot.release_retired());
+        assert!(freed.contains(&id));
+    }
+
+    #[test]
+    fn rotating_repeatedly_never_frees_a_texture_in_the_frame_it_was_shown() {
+        let ctx = egui::Context::default();
+        let mut slot = TextureSlot::default();
+        slot.replace(Some(tiny_texture(&ctx, "r0")));
+        let _ = frame_frees(&ctx, || {});
+
+        for i in 1..=8 {
+            let shown = slot.current().unwrap().id();
+            // Each frame: release last frame's leftovers, then rotate
+            // (which replaces the texture after it was painted).
+            let freed = frame_frees(&ctx, || {
+                slot.release_retired();
+                let next = tiny_texture(&ctx, &format!("r{i}"));
+                slot.replace(Some(next));
+            });
+            assert!(!freed.contains(&shown), "rotation {i} freed a texture it had just shown");
+        }
+    }
+
 }

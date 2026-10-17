@@ -563,9 +563,13 @@ impl Player {
             .min_display_pts_us
             .store(i64::MAX, Ordering::Relaxed);
         self.shared.video_queue.lock().unwrap().clear();
-        self.shared
-            .clock_frozen
-            .store(true, Ordering::Relaxed);
+        // Only a video frame arriving in `tick()` ever thaws the clock,
+        // so freezing it for an audio-only file would stop it for good.
+        if self.has_video() {
+            self.shared
+                .clock_frozen
+                .store(true, Ordering::Relaxed);
+        }
         let _ = self.cmd_tx.send(Command::Seek(target_us));
         // Briefly wait for the demuxer to actually pick up the new
         // seek target (it overwrites `min_display_pts_us` from MAX
@@ -802,6 +806,12 @@ impl Player {
 
     pub fn has_audio(&self) -> bool {
         self.shared.state.lock().unwrap().has_audio
+    }
+
+    /// False for audio-only files, including ones whose only "video"
+    /// stream is album art.
+    pub fn has_video(&self) -> bool {
+        self.shared.state.lock().unwrap().width > 0
     }
 
     /// True while the player is in post-seek priming, i.e. the
@@ -1271,15 +1281,15 @@ impl Player {
             // `set_nv12_ndc_rect` is called.
             let ndc_buffer = backend.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("nv12_ndc_uniform"),
-                size: 16,
+                size: 32,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let initial_ndc: [f32; 4] = [-1.0, 1.0, 1.0, -1.0];
+            let initial_ndc: [f32; 8] = [-1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0];
             let initial_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     initial_ndc.as_ptr() as *const u8,
-                    std::mem::size_of::<[f32; 4]>(),
+                    std::mem::size_of::<[f32; 8]>(),
                 )
             };
             backend.queue.write_buffer(&ndc_buffer, 0, initial_bytes);
@@ -1391,6 +1401,7 @@ impl Player {
         video_rect: egui::Rect,
         screen_size_points: egui::Vec2,
         pixels_per_point: f32,
+        rotation_degrees: u16,
     ) {
         let backend = match self.wgpu.as_ref() {
             Some(b) => b,
@@ -1419,11 +1430,12 @@ impl Player {
         // NDC Y: +1 at top, -1 at bottom (wgpu).
         let ndc_t = 1.0 - (rect_t - vp_t) / vp_h * 2.0;
         let ndc_b = 1.0 - (rect_b - vp_t) / vp_h * 2.0;
-        let data: [f32; 4] = [ndc_l, ndc_t, ndc_r, ndc_b];
+        let quarter_turns = nv12_quarter_turns(rotation_degrees);
+        let data: [f32; 8] = [ndc_l, ndc_t, ndc_r, ndc_b, quarter_turns as f32, 0.0, 0.0, 0.0];
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 data.as_ptr() as *const u8,
-                std::mem::size_of::<[f32; 4]>(),
+                std::mem::size_of::<[f32; 8]>(),
             )
         };
         backend.queue.write_buffer(&state.ndc_buffer, 0, bytes);
@@ -1957,6 +1969,99 @@ fn start_cpal_output(mut renderer: AudioRenderer, shared: Arc<Shared>) -> Result
 // sends a Flush marker into each channel so the decoder threads flush
 // their internal state and resume cleanly.
 
+/// The video stream to play, if the file has a real one.
+///
+/// Cover art in .mp3/.m4a/.flac is exposed by FFmpeg as a video stream
+/// flagged `ATTACHED_PIC`: one still frame, no timeline. Treating it as
+/// video would put the player on the picture path with nothing to drive
+/// the clock, so such streams count as "no video".
+fn select_video_stream(ictx: &ffmpeg::format::context::Input) -> Option<usize> {
+    use ffmpeg::format::stream::Disposition;
+    let is_cover_art = |s: &ffmpeg::format::stream::Stream| {
+        s.disposition().contains(Disposition::ATTACHED_PIC)
+    };
+    if let Some(best) = ictx.streams().best(ffmpeg::media::Type::Video) {
+        if !is_cover_art(&best) {
+            return Some(best.index());
+        }
+    }
+    ictx.streams()
+        .find(|s| s.parameters().medium() == ffmpeg::media::Type::Video && !is_cover_art(s))
+        .map(|s| s.index())
+}
+
+/// Container duration, falling back to the video stream's own and then
+/// the audio stream's. Container duration is missing on some files
+/// (AV_NOPTS_VALUE arrives as a large negative number) and wrong on
+/// others; anything still non-positive is reported as 0 ("unknown") so
+/// downstream `duration > 0` guards take over rather than computing seek
+/// targets from junk.
+fn media_duration_us(
+    ictx: &ffmpeg::format::context::Input,
+    video_stream_index: Option<usize>,
+    audio_stream_index: Option<usize>,
+) -> i64 {
+    let container = ictx.duration();
+    if container > 0 {
+        return container;
+    }
+    [video_stream_index, audio_stream_index]
+        .into_iter()
+        .flatten()
+        .filter_map(|idx| ictx.stream(idx))
+        .map(|stream| {
+            let d = stream.duration();
+            if d > 0 {
+                ts_to_us(d, stream.time_base())
+            } else {
+                0
+            }
+        })
+        .find(|&d| d > 0)
+        .unwrap_or(0)
+}
+
+/// What a file contains, as far as playback is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaProbe {
+    pub has_video: bool,
+    pub has_audio: bool,
+    pub duration_us: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Inspect a file's streams without decoding anything or touching the
+/// GPU or an audio device. Uses the same stream selection as the player,
+/// so "audio only" here means exactly what it means there.
+pub fn probe_media(path: &Path) -> Result<MediaProbe, String> {
+    let ictx = ffmpeg::format::input(&path).map_err(|e| format!("open: {}", e))?;
+    let video = select_video_stream(&ictx);
+    let audio = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .map(|s| s.index());
+    let (width, height) = video
+        .and_then(|idx| ictx.stream(idx))
+        .map(|s| {
+            // Straight from the stream parameters: opening a decoder
+            // just to learn the size is far too slow when this runs
+            // over a whole library.
+            let params = s.parameters();
+            let p = unsafe { params.as_ptr() };
+            let (w, h) = unsafe { ((*p).width, (*p).height) };
+            (w.max(0) as u32, h.max(0) as u32)
+        })
+        .unwrap_or((0, 0));
+    Ok(MediaProbe {
+        has_video: video.is_some(),
+        has_audio: audio.is_some(),
+        duration_us: media_duration_us(&ictx, video, audio),
+        width,
+        height,
+    })
+}
+
 fn run_decode_pipeline(
     path: PathBuf,
     cmd_rx: Receiver<Command>,
@@ -1969,91 +2074,78 @@ fn run_decode_pipeline(
     let mut ictx =
         ffmpeg::format::input(&path).map_err(|e| format!("open: {}", e))?;
 
-    // --- Video stream ---
-    let (video_stream_index, video_time_base, video_frame_interval_us) = {
-        let stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Video)
-            .ok_or_else(|| "no video stream".to_string())?;
-        let rate = stream.avg_frame_rate();
-        let frame_us = if rate.denominator() > 0 && rate.numerator() > 0 {
-            1_000_000_i64 * rate.denominator() as i64 / rate.numerator() as i64
-        } else {
-            33_333
-        };
-        (stream.index(), stream.time_base(), frame_us)
-    };
+    // --- Video stream (optional) ---
+    // Audio-only files (.mp3, .m4a, an .mp4 with just a soundtrack) have
+    // no picture. The player then runs as a pure audio player: no video
+    // worker, no frame queue, and the audio output alone drives the clock.
+    let video_stream_index = select_video_stream(&ictx);
+    let video_frame_interval_us = video_stream_index
+        .and_then(|idx| ictx.stream(idx))
+        .map(|stream| {
+            let rate = stream.avg_frame_rate();
+            if rate.denominator() > 0 && rate.numerator() > 0 {
+                1_000_000_i64 * rate.denominator() as i64 / rate.numerator() as i64
+            } else {
+                33_333
+            }
+        })
+        .unwrap_or(33_333);
+    let video_time_base = video_stream_index
+        .and_then(|idx| ictx.stream(idx))
+        .map(|stream| stream.time_base())
+        .unwrap_or_else(|| ffmpeg::Rational::new(1, 1));
 
     // Re-enabled now that decode threads are split: HW transfer lives
     // on the video thread and can no longer starve the audio path.
     const HW_ACCEL: bool = true;
 
-    let (video_decoder, hw_enabled) = {
-        let stream = ictx
-            .stream(video_stream_index)
-            .ok_or_else(|| "stream disappeared".to_string())?;
-        let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|e| format!("video codec ctx: {}", e))?;
-        // Enable multi-threaded decoding — 0 means "use one thread per
-        // available core". Big win for software H.264/HEVC decode on
-        // multi-core machines. Harmless when HW decode is active.
-        ctx.set_threading(ffmpeg::codec::threading::Config {
-            kind: ffmpeg::codec::threading::Type::Frame,
-            count: 0,
-        });
-        let hw = if HW_ACCEL {
-            unsafe { try_enable_hw_accel(ctx.as_mut_ptr()) }
-        } else {
-            false
-        };
-        let dec = ctx
-            .decoder()
-            .video()
-            .map_err(|e| format!("video decoder: {}", e))?;
-        (dec, hw)
+    let video_decoder = match video_stream_index {
+        None => None,
+        Some(video_stream_index) => {
+            let stream = ictx
+                .stream(video_stream_index)
+                .ok_or_else(|| "stream disappeared".to_string())?;
+            let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| format!("video codec ctx: {}", e))?;
+            // Enable multi-threaded decoding — 0 means "use one thread per
+            // available core". Big win for software H.264/HEVC decode on
+            // multi-core machines. Harmless when HW decode is active.
+            ctx.set_threading(ffmpeg::codec::threading::Config {
+                kind: ffmpeg::codec::threading::Type::Frame,
+                count: 0,
+            });
+            if HW_ACCEL {
+                unsafe { try_enable_hw_accel(ctx.as_mut_ptr()) };
+            }
+            let dec = ctx
+                .decoder()
+                .video()
+                .map_err(|e| format!("video decoder: {}", e))?;
+            Some(dec)
+        }
     };
-    let _ = hw_enabled;
-    let video_src_w = video_decoder.width();
-    let video_src_h = video_decoder.height();
+    let (video_src_w, video_src_h) = video_decoder
+        .as_ref()
+        .map(|d| (d.width(), d.height()))
+        .unwrap_or((0, 0));
     // A zero-sized video reaches swscale and the wgpu texture
     // descriptor as an invalid extent, neither of which fails
     // gracefully — swscale asserts and wgpu raises a validation
     // error that aborts the process. Refuse the file instead.
-    if video_src_w == 0 || video_src_h == 0 {
+    if video_decoder.is_some() && (video_src_w == 0 || video_src_h == 0) {
         return Err(format!(
             "video reports zero dimensions ({}x{})",
             video_src_w, video_src_h
         ));
     }
 
-    // Container duration is missing on some files (AV_NOPTS_VALUE
-    // arrives as a large negative number) and wrong on others. Fall
-    // back to the video stream's own duration, and treat anything
-    // still non-positive as unknown so downstream `duration > 0`
-    // guards take over rather than computing seek targets from junk.
-    let duration_us = {
-        let container = ictx.duration();
-        if container > 0 {
-            container
-        } else {
-            ictx.stream(video_stream_index)
-                .map(|stream| {
-                    let d = stream.duration();
-                    if d > 0 {
-                        ts_to_us(d, stream.time_base())
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0)
-        }
-    };
-
     // --- Audio stream (optional) ---
     let audio_info = ictx
         .streams()
         .best(ffmpeg::media::Type::Audio)
         .map(|s| s.index());
+
+    let duration_us = media_duration_us(&ictx, video_stream_index, audio_info);
 
     // The resampler is built by the audio worker from the first decoded
     // frame: a frame's format is authoritative, whereas the stream
@@ -2104,7 +2196,12 @@ fn run_decode_pipeline(
     // the workers, keeping memory bounded. Flushes are signalled
     // out-of-band via `shared.flush_seq`, so send-side blocking
     // here can't deadlock seeks even when the worker is paused.
-    let (video_tx, video_rx) = mpsc::sync_channel::<DecodeMsg>(8);
+    let (video_tx_opt, video_rx_opt) = if video_decoder.is_some() {
+        let (tx, rx) = mpsc::sync_channel::<DecodeMsg>(8);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (audio_tx_opt, audio_rx_opt) = if audio_stream_index.is_some() {
         let (tx, rx) = mpsc::sync_channel::<DecodeMsg>(16);
         (Some(tx), Some(rx))
@@ -2112,20 +2209,24 @@ fn run_decode_pipeline(
         (None, None)
     };
 
-    let video_handle = {
-        let shared_c = shared.clone();
-        let ctx_c = egui_ctx.clone();
-        thread::spawn(move || {
-            video_decode_loop(
-                video_decoder,
-                video_time_base,
-                video_rx,
-                shared_c,
-                ctx_c,
-                high_bit_depth_enabled,
-            );
-        })
+    let video_handle = match (video_decoder, video_rx_opt) {
+        (Some(dec), Some(rx)) => {
+            let shared_c = shared.clone();
+            let ctx_c = egui_ctx.clone();
+            Some(thread::spawn(move || {
+                video_decode_loop(
+                    dec,
+                    video_time_base,
+                    rx,
+                    shared_c,
+                    ctx_c,
+                    high_bit_depth_enabled,
+                );
+            }))
+        }
+        _ => None,
     };
+    let has_video = video_tx_opt.is_some();
     let audio_handle = match (audio_decoder, audio_rx_opt) {
         (Some(dec), Some(rx)) => {
             let shared_a = shared.clone();
@@ -2244,7 +2345,9 @@ fn run_decode_pipeline(
             let pushed = shared
                 .post_seek_frames_pushed
                 .load(Ordering::Relaxed);
-            if pushed > 0 || prime_packets_read >= MAX_PRIME_PACKETS {
+            // Priming exists to land one video frame at the seek target.
+            // With no video there is nothing to wait for.
+            if !has_video || pushed > 0 || prime_packets_read >= MAX_PRIME_PACKETS {
                 priming_after_seek = false;
             }
         }
@@ -2255,6 +2358,14 @@ fn run_decode_pipeline(
         // path. `PAUSED_FILL_TARGET` is the depth we aim for; once
         // the queue has that many buffered frames we sleep until
         // tick() drains some.
+        if paused && !priming_after_seek && !has_video {
+            // Audio-only: nothing to pre-buffer for stepping, and
+            // decoding ahead would only fill the audio ring with sound
+            // nobody asked to hear. Resuming reads from the current
+            // position (a paused seek has already repositioned).
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         if paused && !priming_after_seek {
             const PAUSED_FILL_TARGET: usize = 12;
             let qlen = shared.video_queue.lock().unwrap().len();
@@ -2274,7 +2385,9 @@ fn run_decode_pipeline(
                 eof_drain_sent = true;
                 shared.drain_complete.store(false, Ordering::Relaxed);
                 let tag = shared.flush_seq.load(Ordering::Relaxed);
-                send_drain(&video_tx, tag, &shared);
+                if let Some(tx) = video_tx_opt.as_ref() {
+                    send_drain(tx, tag, &shared);
+                }
                 if let Some(tx) = audio_tx_opt.as_ref() {
                     send_drain(tx, tag, &shared);
                 }
@@ -2369,7 +2482,7 @@ fn run_decode_pipeline(
         }
 
         let packet_idx = packet.stream();
-        if packet_idx == video_stream_index {
+        if let (Some(video_tx), true) = (video_tx_opt.as_ref(), Some(packet_idx) == video_stream_index) {
             let tag = shared.flush_seq.load(Ordering::Relaxed);
             let mut msg = Some(DecodeMsg::Packet(packet, tag));
             loop {
@@ -2457,9 +2570,11 @@ fn run_decode_pipeline(
     }
 
     // Drop the send halves so the workers exit their recv loops.
-    drop(video_tx);
+    drop(video_tx_opt);
     drop(audio_tx_opt);
-    let _ = video_handle.join();
+    if let Some(h) = video_handle {
+        let _ = h.join();
+    }
     if let Some(h) = audio_handle {
         let _ = h.join();
     }
@@ -2536,7 +2651,11 @@ fn reposition(
     shared.last_pushed_pts_us.store(target_us, Ordering::Relaxed);
     shared.drain_complete.store(false, Ordering::Relaxed);
     shared.audio_clock_us.store(target_us, Ordering::Relaxed);
-    shared.clock_frozen.store(true, Ordering::Relaxed);
+    // Frozen until the first post-seek video frame lands; see
+    // `Player::seek_us` for why audio-only files must not freeze.
+    shared
+        .clock_frozen
+        .store(shared.state.lock().unwrap().width > 0, Ordering::Relaxed);
     // Audio decoded from the keyframe up to the target belongs before
     // the first picture the viewer will see; the audio worker drops it.
     shared
@@ -3010,8 +3129,10 @@ const NV12_SHADER_SRC: &str = r#"
 // based on the unclamped video_rect relative to the clamped
 // egui_wgpu viewport, so the quad is positioned correctly even when
 // panning pushes the video partially off-screen.
+// `rot.x` is the display rotation in quarter turns clockwise (0..3).
 struct NdcRect {
     rect: vec4<f32>,
+    rot: vec4<f32>,
 };
 @group(0) @binding(3) var<uniform> ndc: NdcRect;
 
@@ -3034,17 +3155,21 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
         vec2<f32>(r, b),
         vec2<f32>(l, b),
     );
-    var uvs = array<vec2<f32>, 6>(
+    // Quad corners are TL, TR, BR, BL. Rotating the picture clockwise
+    // by q quarter turns means each corner samples the source corner
+    // q steps back round the same cycle.
+    var corner_of = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    var corner_uv = array<vec2<f32>, 4>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 1.0),
         vec2<f32>(0.0, 1.0),
     );
+    let q = u32(ndc.rot.x + 0.5);
+    let src_corner = (corner_of[idx] + 4u - (q % 4u)) % 4u;
     var out: VsOut;
     out.pos = vec4<f32>(positions[idx], 0.0, 1.0);
-    out.uv = uvs[idx];
+    out.uv = corner_uv[src_corner];
     return out;
 }
 
@@ -3072,6 +3197,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // FRAGMENT_RETURN
 }
 "#;
+
+/// Clockwise quarter turns (0..=3) for a rotation in degrees. Any multiple
+/// of 90 is accepted; anything else is treated as upright.
+pub fn nv12_quarter_turns(degrees: u16) -> u32 {
+    if degrees % 90 == 0 { (degrees / 90 % 4) as u32 } else { 0 }
+}
+
+/// Texture coordinates for the quad's corners (top-left, top-right,
+/// bottom-right, bottom-left) when the picture is shown rotated
+/// `degrees` clockwise. The NV12 vertex shader implements the same
+/// mapping (`src_corner`); the two must stay in step.
+pub fn rotated_corner_uvs(degrees: u16) -> [(f32, f32); 4] {
+    const CORNERS: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+    let q = nv12_quarter_turns(degrees) as usize;
+    std::array::from_fn(|c| CORNERS[(c + 4 - q) % 4])
+}
 
 struct YuvRenderer {
     pipeline: Arc<wgpu::RenderPipeline>,
@@ -4009,5 +4150,301 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Audio-only playback
+    //
+    // These drive the real demux/decode pipeline against tiny generated
+    // fixtures (tests/fixtures). They need FFmpeg's DLLs but no window,
+    // GPU, or audio device: decoded samples land in a ring buffer the
+    // test reads directly.
+    // ------------------------------------------------------------------
+
+    fn fixture(name: &str) -> PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name);
+        assert!(path.exists(), "missing fixture {}", path.display());
+        path
+    }
+
+    #[test]
+    fn probe_reports_audio_only_files_as_having_no_video() {
+        let _ = ffmpeg::init();
+        for name in ["audio_only.mp4", "tone.m4a", "tone.mp3"] {
+            let probe = probe_media(&fixture(name)).unwrap_or_else(|e| panic!("{}: {}", name, e));
+            assert!(!probe.has_video, "{} should have no video", name);
+            assert!(probe.has_audio, "{} should have audio", name);
+            assert_eq!((probe.width, probe.height), (0, 0), "{}", name);
+            assert!(
+                (900_000..1_200_000).contains(&probe.duration_us),
+                "{}: duration {}us should be about 1s",
+                name,
+                probe.duration_us
+            );
+        }
+    }
+
+    #[test]
+    fn probe_ignores_album_art_when_deciding_if_a_file_has_video() {
+        let _ = ffmpeg::init();
+        // The cover image is a real video stream as far as FFmpeg is
+        // concerned; the player must still treat the file as audio.
+        let probe = probe_media(&fixture("tone_cover.mp3")).unwrap();
+        assert!(!probe.has_video, "cover art is not video");
+        assert!(probe.has_audio);
+        assert!(probe.duration_us > 900_000);
+    }
+
+    #[test]
+    fn probe_still_reports_real_video() {
+        let _ = ffmpeg::init();
+        let probe = probe_media(&fixture("video_with_audio.mp4")).unwrap();
+        assert!(probe.has_video && probe.has_audio);
+        assert_eq!((probe.width, probe.height), (64, 48));
+
+        let silent = probe_media(&fixture("video_only.mp4")).unwrap();
+        assert!(silent.has_video && !silent.has_audio);
+    }
+
+    #[test]
+    fn probe_errors_instead_of_panicking_on_a_missing_file() {
+        let _ = ffmpeg::init();
+        assert!(probe_media(Path::new("definitely/not/here.mp3")).is_err());
+    }
+
+    /// A running pipeline plus the pieces a `Player` would normally hold.
+    struct PipelineHarness {
+        shared: Arc<Shared>,
+        cmd_tx: Sender<Command>,
+        consumer: <HeapRb<f32> as Split>::Cons,
+        handle: Option<thread::JoinHandle<Result<(), String>>>,
+        samples_seen: usize,
+    }
+
+    impl PipelineHarness {
+        fn start(name: &str) -> Self {
+            let _ = ffmpeg::init();
+            let shared = shared_for_test();
+            {
+                let mut st = shared.state.lock().unwrap();
+                st.player_state = PlayerState::Loading;
+                st.duration_us = 0;
+                st.width = 0;
+                st.height = 0;
+                st.has_audio = false;
+            }
+            shared.flush_seq.store(0, Ordering::Relaxed);
+            shared.audio_paused.store(true, Ordering::Relaxed);
+            let shared = Arc::new(shared);
+
+            let rate = 48_000u32;
+            let (producer, consumer) = HeapRb::<f32>::new(rate as usize * 2 * 4).split();
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let path = fixture(name);
+            let shared_c = shared.clone();
+            let handle = thread::spawn(move || {
+                run_decode_pipeline(
+                    path,
+                    cmd_rx,
+                    shared_c,
+                    producer,
+                    egui::Context::default(),
+                    rate,
+                    false,
+                )
+            });
+            Self { shared, cmd_tx, consumer, handle: Some(handle), samples_seen: 0 }
+        }
+
+        fn wait_until(&mut self, what: &str, mut cond: impl FnMut(&mut Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if cond(self) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let st = self.shared.state.lock().unwrap();
+            panic!(
+                "timed out waiting for {} (state {:?}, error {:?})",
+                what, st.player_state, st.error
+            );
+        }
+
+        fn state(&self) -> PlayerState {
+            self.shared.state.lock().unwrap().player_state
+        }
+
+        /// Drain whatever the decoder has produced, as the audio
+        /// output would, returning how many samples that was.
+        fn drain_samples(&mut self) -> usize {
+            let mut n = 0;
+            while self.consumer.try_pop().is_some() {
+                n += 1;
+            }
+            self.samples_seen += n;
+            n
+        }
+
+        fn finish(mut self) -> Result<(), String> {
+            let _ = self.cmd_tx.send(Command::Stop);
+            self.shared.stopping.store(true, Ordering::Relaxed);
+            self.handle.take().unwrap().join().expect("pipeline thread panicked")
+        }
+    }
+
+    fn assert_plays_as_audio_only(name: &str) {
+        let mut h = PipelineHarness::start(name);
+        h.wait_until("initialisation", |h| h.state() != PlayerState::Loading);
+        {
+            let st = h.shared.state.lock().unwrap();
+            assert_eq!(st.player_state, PlayerState::Paused, "{}: error {:?}", name, st.error);
+            assert!(st.has_audio, "{}", name);
+            assert_eq!((st.width, st.height), (0, 0), "{}: no picture", name);
+            assert!(st.duration_us > 900_000, "{}: duration {}", name, st.duration_us);
+        }
+
+        h.cmd_tx.send(Command::Play).unwrap();
+        // Roughly a second of 48 kHz stereo; allow for encoder padding.
+        h.wait_until("decoded audio", |h| {
+            h.drain_samples();
+            h.samples_seen > 48_000
+        });
+        assert!(
+            !h.shared.clock_frozen.load(Ordering::Relaxed),
+            "{}: nothing would ever unfreeze the clock",
+            name
+        );
+        h.finish().unwrap_or_else(|e| panic!("{}: {}", name, e));
+    }
+
+    #[test]
+    fn audio_only_mp4_decodes_without_a_video_stream() {
+        assert_plays_as_audio_only("audio_only.mp4");
+    }
+
+    #[test]
+    fn m4a_decodes_without_a_video_stream() {
+        assert_plays_as_audio_only("tone.m4a");
+    }
+
+    #[test]
+    fn mp3_decodes_without_a_video_stream() {
+        assert_plays_as_audio_only("tone.mp3");
+    }
+
+    #[test]
+    fn mp3_with_cover_art_plays_as_audio_only() {
+        assert_plays_as_audio_only("tone_cover.mp3");
+    }
+
+    #[test]
+    fn audio_only_seek_repositions_and_keeps_playing() {
+        let mut h = PipelineHarness::start("tone.mp3");
+        h.wait_until("initialisation", |h| h.state() != PlayerState::Loading);
+        h.cmd_tx.send(Command::Play).unwrap();
+        h.wait_until("first audio", |h| {
+            h.drain_samples();
+            h.samples_seen > 0
+        });
+
+        h.cmd_tx.send(Command::Seek(500_000)).unwrap();
+        h.wait_until("seek to land", |h| {
+            h.shared.audio_clock_us.load(Ordering::Relaxed) == 500_000
+        });
+        // A video seek freezes the clock until a frame lands. There are
+        // no frames here, so a frozen clock would be frozen forever.
+        assert!(!h.shared.clock_frozen.load(Ordering::Relaxed));
+
+        // And audio from the new position keeps arriving.
+        let before = h.samples_seen;
+        h.wait_until("audio after seek", |h| {
+            h.drain_samples();
+            h.samples_seen > before
+        });
+        h.finish().unwrap();
+    }
+
+    #[test]
+    fn audio_only_playback_reaches_end_of_file() {
+        let mut h = PipelineHarness::start("tone.m4a");
+        h.wait_until("initialisation", |h| h.state() != PlayerState::Loading);
+        h.cmd_tx.send(Command::Play).unwrap();
+        // Keep draining so the demuxer is never held up by a full ring,
+        // then expect the end-of-file state rather than a hang.
+        h.wait_until("end of file", |h| {
+            h.drain_samples();
+            h.state() == PlayerState::EndOfFile
+        });
+        h.finish().unwrap();
+    }
+
+    #[test]
+    fn audio_only_pipeline_stays_idle_while_paused() {
+        let mut h = PipelineHarness::start("tone.mp3");
+        h.wait_until("initialisation", |h| h.state() != PlayerState::Loading);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            h.drain_samples(),
+            0,
+            "a paused audio-only file must not decode ahead"
+        );
+        h.finish().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Video rotation on the NV12 (GPU) path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn quarter_turns_normalise_rotation_angles() {
+        assert_eq!(nv12_quarter_turns(0), 0);
+        assert_eq!(nv12_quarter_turns(90), 1);
+        assert_eq!(nv12_quarter_turns(180), 2);
+        assert_eq!(nv12_quarter_turns(270), 3);
+        assert_eq!(nv12_quarter_turns(360), 0);
+        assert_eq!(nv12_quarter_turns(45), 0, "non-right angles stay upright");
+    }
+
+    #[test]
+    fn rotated_corner_uvs_match_each_clockwise_rotation() {
+        // Corner order: top-left, top-right, bottom-right, bottom-left.
+        // Rotating clockwise 90: the on-screen top-left shows the
+        // source's bottom-left, and so on round the picture.
+        assert_eq!(rotated_corner_uvs(0),   [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        assert_eq!(rotated_corner_uvs(90),  [(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]);
+        assert_eq!(rotated_corner_uvs(180), [(1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (1.0, 0.0)]);
+        assert_eq!(rotated_corner_uvs(270), [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
+    }
+
+    #[test]
+    fn four_right_rotations_return_to_upright() {
+        let total = (0..4).fold(0u16, |deg, _| (deg + 90) % 360);
+        assert_eq!(rotated_corner_uvs(total), rotated_corner_uvs(0));
+    }
+
+    /// The shader runs on the user's GPU, where a mistake is a runtime
+    /// abort. Compile and validate it here, for both target formats,
+    /// and check the rotation input is really part of the interface.
+    #[test]
+    fn nv12_shader_compiles_and_validates() {
+        for fragment in [
+            "return vec4<f32>(r_g, g_g, b_g, 1.0);",
+            "return vec4<f32>(srgb_to_linear(r_g), srgb_to_linear(g_g), srgb_to_linear(b_g), 1.0);",
+        ] {
+            let src = NV12_SHADER_SRC.replace("// FRAGMENT_RETURN", fragment);
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("WGSL parse error: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("WGSL validation error: {:?}", e));
+        }
+        assert!(NV12_SHADER_SRC.contains("rot: vec4<f32>"), "rotation uniform missing");
     }
 }

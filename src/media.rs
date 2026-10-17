@@ -40,6 +40,13 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mpg", "mpeg", "3gp", "3g2", "ogv", "ts", "vob", "mts", "m2ts",
 ];
 
+/// Audio-only formats. They play through the same FFmpeg-backed player
+/// as video, just without a picture. (`.mp4`/`.mkv`/`.webm` files that
+/// happen to carry only a soundtrack are covered by `VIDEO_EXTENSIONS`.)
+pub const AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aif", "aiff",
+];
+
 /// Hard ceiling on decoded pixel count. `image` will happily allocate
 /// a buffer for whatever dimensions a header claims, so a corrupt or
 /// hostile header (or a genuine gigapixel panorama) can ask for tens
@@ -64,9 +71,16 @@ pub fn is_raw_file(path: &Path) -> bool { has_ext(path, RAW_EXTENSIONS) }
 pub fn is_heif_file(path: &Path) -> bool { has_ext(path, HEIF_EXTENSIONS) }
 pub fn is_image_file(path: &Path) -> bool { has_ext(path, IMAGE_EXTENSIONS) }
 pub fn is_video_file(path: &Path) -> bool { has_ext(path, VIDEO_EXTENSIONS) }
+pub fn is_audio_file(path: &Path) -> bool { has_ext(path, AUDIO_EXTENSIONS) }
+
+/// Anything the playback engine handles: video containers (which may
+/// turn out to hold only audio) and audio-only formats.
+pub fn is_playable_file(path: &Path) -> bool {
+    is_video_file(path) || is_audio_file(path)
+}
 
 pub fn is_supported_file(path: &Path) -> bool {
-    is_image_file(path) || is_video_file(path)
+    is_image_file(path) || is_playable_file(path)
 }
 
 /// Reject dimensions that would produce an unusable or dangerous
@@ -363,6 +377,36 @@ mod tests {
         assert!(is_raw_file(&PathBuf::from("shot.NEF")));
         assert!(!is_supported_file(&PathBuf::from("cache.ithmb")));
         assert!(!is_supported_file(&PathBuf::from("noextension")));
+    }
+
+    #[test]
+    fn audio_extensions_are_supported_and_playable_but_not_images_or_video() {
+        for name in [
+            "a.mp3", "a.M4A", "a.aac", "a.wav", "a.flac", "a.ogg", "a.oga", "a.opus", "a.wma",
+            "a.aif", "a.aiff",
+        ] {
+            let p = PathBuf::from(name);
+            assert!(is_audio_file(&p), "{}", name);
+            assert!(is_playable_file(&p), "{}", name);
+            assert!(is_supported_file(&p), "{}", name);
+            assert!(!is_image_file(&p) && !is_video_file(&p), "{}", name);
+        }
+    }
+
+    #[test]
+    fn mp4_is_playable_whether_or_not_it_has_video() {
+        // Audio-only .mp4 files are common (voice memos, podcast rips)
+        // and are told apart by their streams, not their extension.
+        let p = PathBuf::from("memo.mp4");
+        assert!(is_video_file(&p) && is_playable_file(&p) && is_supported_file(&p));
+    }
+
+    #[test]
+    fn the_extension_lists_do_not_overlap() {
+        for ext in AUDIO_EXTENSIONS {
+            assert!(!VIDEO_EXTENSIONS.contains(ext), "{} is in both audio and video", ext);
+            assert!(!IMAGE_EXTENSIONS.contains(ext), "{} is in both audio and image", ext);
+        }
     }
 
     #[test]

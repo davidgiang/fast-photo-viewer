@@ -19,12 +19,13 @@ To set as your default viewer, go to **Windows Settings > Default Apps** and sea
 - **Parallel Scanning:** Uses background threads to scan directories.
 - **Image Support:** PNG, JPEG, WEBP, GIF, BMP, TIFF, ICO, SVG. Handles wrong extensions and truncated files.
 - **Video Support:** MP4, MKV, AVI, MOV, WMV, FLV, WEBM, M4V, MPG, MPEG, 3GP, OGV, VOB with full playback controls.
+- **Audio Support:** MP3, M4A, AAC, WAV, FLAC, OGG, OPUS, WMA, AIFF — and MP4/MKV/etc. files that contain only audio — play with the same controls and a simple placeholder in place of the picture.
 - **GPU Rendering:** Hardware-accelerated display.
 - **File Associations:** Can be set as the default Windows viewer for images and videos.
 - **Random Slideshow:** Press `Space` or `Right Arrow`.
 - **Navigation History:** Use `Left Arrow`.
 - **Zoom & Pan:** Scroll to zoom, drag to pan. Works on both images and videos.
-- **Media Filter:** Cycle between All / Images Only / Videos Only with `M`.
+- **Media Filter:** Cycle between All / Images / Video / Audio with `M`. Press `Shift+M` (or click **Filters**) for advanced filters: any mix of types, video/audio length range, resolution range (by shorter side), horizontal / vertical / square shape (photos and video), and with/without sound. File details are read in the background as soon as a folder opens (gently, until a filter needs them) and remembered in `%LOCALAPPDATA%\fast-photo-viewer\index-v1.tsv` so an unchanged file is never read twice.
 - **Fullscreen:** Toggle with `F11` or the fullscreen button.
 - **Audio Detection:** Automatically detects whether a video has audio; shows mute indicator if not.
 - **Click to Pause:** Click anywhere on a video to toggle play/pause.
@@ -49,7 +50,7 @@ Or launch the application and use the keyboard shortcuts:
 | `+` / `-` | Zoom in / out |
 | Scroll wheel | Zoom |
 | Click + drag | Pan |
-| `M` | Cycle media filter (All / Images / Videos) |
+| `M` | Cycle media filter (All / Images / Video / Audio); `Shift+M` opens advanced filters |
 | `F11` | Toggle fullscreen |
 | `Esc` × 2 | Close |
 
@@ -64,7 +65,7 @@ Or launch the application and use the keyboard shortcuts:
 | Scroll wheel | Zoom |
 | Click | Play / Pause |
 | Click + drag | Pan |
-| `M` | Cycle media filter (All / Images / Videos) |
+| `M` | Cycle media filter (All / Images / Video / Audio); `Shift+M` opens advanced filters |
 | `F11` | Toggle fullscreen |
 | `Esc` × 2 | Close |
 

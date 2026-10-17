@@ -56,3 +56,8 @@ features = [
 # because ChannelLayout::mask() returns None and the crate unwraps it.
 [patch.crates-io]
 ffmpeg-the-third = { path = "vendor/ffmpeg-the-third" }
+
+[dev-dependencies]
+# Compiles the NV12 WGSL on the CPU in tests, so a shader mistake fails
+# `cargo test` instead of aborting at runtime on a GPU.
+naga = { version = "22", features = ["wgsl-in"] }
