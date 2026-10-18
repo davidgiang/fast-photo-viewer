@@ -2231,7 +2231,15 @@ fn run_decode_pipeline(
         (Some(dec), Some(rx)) => {
             let shared_a = shared.clone();
             Some(thread::spawn(move || {
-                audio_decode_loop(dec, audio_time_base, rx, shared_a, audio_producer, target_rate);
+                audio_decode_loop(
+                    dec,
+                    audio_time_base,
+                    rx,
+                    shared_a,
+                    audio_producer,
+                    target_rate,
+                    has_video,
+                );
             }))
         }
         _ => None,
@@ -3553,11 +3561,16 @@ fn resample_into(
 /// grow before the push lands. Runs are whole stereo pairs, so left and
 /// right can't drift out of step.
 ///
-/// If the ring stays full past a short deadline the remainder is
-/// dropped. The ring only stays full when the output isn't draining,
-/// and blocking here would back-pressure the demuxer and stall video
-/// priming after a seek; the next span simply starts later, so the
-/// clock skips the gap rather than drifting.
+/// When the ring is full and `wait_for_room` says the output is draining
+/// it, this waits: the decoder is simply ahead of the speakers, and the
+/// back-pressure reaches the demuxer through the packet channel. Dropping
+/// instead made every file with no picture to throttle the demuxer (audio
+/// only, or little video) skip ahead whenever it outlasted the ring.
+///
+/// Otherwise (paused, or the output has failed) the ring isn't draining,
+/// and blocking would stall video priming after a seek; past a short
+/// deadline the remainder is dropped and the next span starts later, so
+/// the clock skips the gap rather than drifting.
 fn push_timed(
     samples: &[f32],
     mut pts_us: i64,
@@ -3566,6 +3579,7 @@ fn push_timed(
     producer: &mut AudioProducer,
     spans: &Mutex<VecDeque<AudioSpan>>,
     us_per_pair: f64,
+    wait_for_room: impl Fn() -> bool,
     abandon: impl Fn() -> bool,
 ) {
     const PUSH_DEADLINE: Duration = Duration::from_millis(4);
@@ -3575,10 +3589,16 @@ fn push_timed(
         let room = producer.vacant_len() & !1;
         let n = room.min(samples.len() - offset);
         if n == 0 {
-            if started.elapsed() > PUSH_DEADLINE || abandon() {
+            if abandon() {
                 return;
             }
-            thread::yield_now();
+            if wait_for_room() {
+                thread::sleep(Duration::from_millis(1));
+            } else if started.elapsed() > PUSH_DEADLINE {
+                return;
+            } else {
+                thread::yield_now();
+            }
             continue;
         }
         {
@@ -3611,6 +3631,7 @@ fn audio_decode_loop(
     shared: Arc<Shared>,
     mut producer: AudioProducer,
     target_rate: u32,
+    has_video: bool,
 ) {
     let us_per_pair = 1_000_000.0 / target_rate.max(1) as f64;
     let mut frame = ffmpeg::frame::Audio::empty();
@@ -3685,7 +3706,12 @@ fn audio_decode_loop(
                 .map(|t| ts_to_us(t, time_base))
                 .or(next_pts_us)
                 .unwrap_or(0);
-            next_pts_us = Some(pts_us + (pairs as f64 * us_per_pair).round() as i64);
+            let end_pts_us = pts_us + (pairs as f64 * us_per_pair).round() as i64;
+            next_pts_us = Some(end_pts_us);
+            // The end of the file is when the last sound has been heard,
+            // not just the last picture; with no picture it is the only
+            // thing there is to wait for.
+            shared.last_pushed_pts_us.fetch_max(end_pts_us, Ordering::Relaxed);
 
             // Drop audio that precedes the seek target.
             let trim_before = shared.audio_trim_before_us.load(Ordering::Relaxed);
@@ -3710,6 +3736,10 @@ fn audio_decode_loop(
                 &shared.audio_spans,
                 us_per_pair,
                 || {
+                    !shared.audio_paused.load(Ordering::Relaxed)
+                        && !shared.audio_output_failed.load(Ordering::Relaxed)
+                },
+                || {
                     shared.stopping.load(Ordering::Relaxed)
                         || shared.flush_seq.load(Ordering::Acquire) != seq
                 },
@@ -3720,6 +3750,13 @@ fn audio_decode_loop(
             decoder.flush();
             if shared.flush_seq.load(Ordering::Acquire) == last_flush_seq {
                 shared.audio_exhausted.store(true, Ordering::Relaxed);
+                // With no video thread to report the codec drained, the
+                // audio is the whole file; without this the end is never
+                // recognised (the silence the output plays afterwards
+                // keeps the clock moving, so no stall ever ends it).
+                if !has_video {
+                    shared.drain_complete.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -4107,7 +4144,7 @@ mod tests {
         let samples: Vec<f32> = (0..16).map(|i| i as f32).collect();
 
         // Room for 10: one span of 10, the rest dropped at the deadline.
-        push_timed(&samples, 0, 7, &mut pushed_total, &mut prod, &spans, us_per_pair, || false);
+        push_timed(&samples, 0, 7, &mut pushed_total, &mut prod, &spans, us_per_pair, || false, || false);
         assert_eq!(pushed_total, 10);
         assert_eq!(spans.lock().unwrap().back().copied(), Some(span(7, 0, 10, 0)));
 
@@ -4115,7 +4152,7 @@ mod tests {
         for _ in 0..5 {
             cons.try_pop();
         }
-        push_timed(&samples[..6], 104, 7, &mut pushed_total, &mut prod, &spans, us_per_pair, || false);
+        push_timed(&samples[..6], 104, 7, &mut pushed_total, &mut prod, &spans, us_per_pair, || false, || false);
         assert_eq!(spans.lock().unwrap().back().copied(), Some(span(7, 10, 4, 104)));
         assert_eq!(pushed_total, 14);
     }
@@ -4393,6 +4430,192 @@ mod tests {
             "a paused audio-only file must not decode ahead"
         );
         h.finish().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Audio timing: the sound must stay locked to its timestamps
+    //
+    // The clock follows the spans the decoder publishes, so if a file's
+    // audio comes out shorter or longer than its timestamps claim, the
+    // clock (and with it the picture) jumps ahead or lags behind: audio
+    // that "skips ahead" or plays slow.
+    // ------------------------------------------------------------------
+
+    /// Decode a whole file through the real pipeline while playing, with
+    /// an output that drains faster than real time but slower than the
+    /// decoder (as any real device is), so the ring fills up and the
+    /// decoder has to cope with that. Returns every span it published
+    /// plus the total stereo samples produced.
+    fn decode_whole_file(name: &str) -> (Vec<AudioSpan>, usize, i64) {
+        let mut h = PipelineHarness::start(name);
+        h.wait_until("initialisation", |h| h.state() != PlayerState::Loading);
+        let duration_us = h.shared.state.lock().unwrap().duration_us;
+        h.shared.audio_paused.store(false, Ordering::Relaxed);
+        h.cmd_tx.send(Command::Play).unwrap();
+        h.wait_until("end of file", |h| {
+            // 8x real time: 48 kHz stereo is 96 000 samples a second.
+            for _ in 0..3_840 {
+                if h.consumer.try_pop().is_none() {
+                    break;
+                }
+                h.samples_seen += 1;
+            }
+            h.state() == PlayerState::EndOfFile
+        });
+        h.drain_samples();
+        let spans: Vec<AudioSpan> = h.shared.audio_spans.lock().unwrap().iter().copied().collect();
+        let total = h.samples_seen;
+        h.finish().unwrap();
+        (spans, total, duration_us)
+    }
+
+    /// Every sample must play at the timestamp the container gave it:
+    /// span timestamps advance exactly as fast as the samples do, and the
+    /// file yields as much audio as its duration says it should.
+    fn assert_audio_keeps_time(name: &str) {
+        let (spans, total, duration_us) = decode_whole_file(name);
+        assert!(!spans.is_empty(), "{}: no audio was decoded", name);
+        let us_per_pair = 1_000_000.0 / 48_000.0;
+
+        // pts - position-in-stream is constant while audio is contiguous.
+        let offset_of = |s: &AudioSpan| s.pts_us as f64 - (s.pos / 2) as f64 * us_per_pair;
+        // The first run is short by the decoder's and resampler's start-up
+        // delay, so skip it and judge the rest against the typical offset.
+        let mut offsets: Vec<f64> = spans.iter().map(offset_of).collect();
+        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let base = offsets[offsets.len() / 2];
+        for s in spans.iter().skip(1) {
+            let skew_ms = (offset_of(s) - base) / 1000.0;
+            assert!(
+                skew_ms.abs() < 5.0,
+                "{}: audio at sample {} is stamped {:.1} ms off from where it plays \
+                 (positive = clock runs ahead of the sound)",
+                name,
+                s.pos,
+                skew_ms
+            );
+        }
+
+        let produced_us = (total / 2) as f64 * us_per_pair;
+        let drift_ms = (produced_us - duration_us as f64) / 1000.0;
+        assert!(
+            drift_ms.abs() < 100.0,
+            "{}: decoded {:.0} ms of audio from a {:.0} ms file ({:+.0} ms)",
+            name,
+            produced_us / 1000.0,
+            duration_us as f64 / 1000.0,
+            drift_ms
+        );
+    }
+
+    #[test]
+    fn low_sample_rate_mono_audio_keeps_time() {
+        assert_audio_keeps_time("rate8k_mono.mp4");
+    }
+
+    #[test]
+    fn cd_rate_stereo_audio_keeps_time() {
+        assert_audio_keeps_time("rate44k_stereo.mp4");
+    }
+
+    #[test]
+    fn assorted_sample_rates_keep_time() {
+        for name in ["rate11k_mono.m4a", "rate22k_mono.mp3", "rate48k_stereo.m4a"] {
+            assert_audio_keeps_time(name);
+        }
+    }
+
+    /// Play a file to the end the way the app does: the real output
+    /// renderer pulls audio at real-time pace and the pipeline decides
+    /// for itself when the file is over. Returns the stereo samples that
+    /// were actually played when it called the end, and the file's
+    /// duration.
+    fn play_until_end_of_file(name: &str) -> (u64, i64) {
+        let PipelineHarness { shared, cmd_tx, consumer, handle, .. } = PipelineHarness::start(name);
+        let mut renderer = AudioRenderer::new(consumer, shared.clone(), 48_000);
+        let state = || shared.state.lock().unwrap().player_state;
+        let started = Instant::now();
+        while state() == PlayerState::Loading && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let duration_us = shared.state.lock().unwrap().duration_us;
+        shared.audio_paused.store(false, Ordering::Relaxed);
+        cmd_tx.send(Command::Play).unwrap();
+
+        // 10 ms device buffers, delivered on the wall clock.
+        let mut buf = vec![0.0f32; 480 * 2];
+        let started = Instant::now();
+        let mut next = started;
+        let limit = Duration::from_micros(duration_us as u64) + Duration::from_secs(10);
+        while state() != PlayerState::EndOfFile && started.elapsed() < limit {
+            renderer.render(&mut buf, 2, Instant::now());
+            next += Duration::from_millis(10);
+            thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        let ended = state() == PlayerState::EndOfFile;
+        let played = renderer.timeline.popped;
+        let _ = cmd_tx.send(Command::Stop);
+        shared.stopping.store(true, Ordering::Relaxed);
+        let _ = handle.unwrap().join();
+        assert!(ended, "{}: never reported end of file", name);
+        (played, duration_us)
+    }
+
+    /// The end of the file must not be called until the listener has
+    /// heard all of it; calling it early cuts off the tail (or, when
+    /// looping, restarts over it).
+    #[test]
+    fn audio_plays_to_the_very_end_before_the_file_ends() {
+        let (played, duration_us) = play_until_end_of_file("rate8k_mono.mp4");
+        let played_us = (played / 2) as f64 * 1_000_000.0 / 48_000.0;
+        let cut_ms = (duration_us as f64 - played_us) / 1000.0;
+        assert!(
+            cut_ms < 150.0,
+            "end of file reported with the last {:.0} ms ({:.1}%) never played",
+            cut_ms,
+            cut_ms * 1000.0 / duration_us as f64 * 100.0
+        );
+    }
+
+    /// With looping on, a file with no picture must start over by itself
+    /// and keep playing, not fall silent at the end.
+    #[test]
+    fn looping_audio_replays_automatically() {
+        let PipelineHarness { shared, cmd_tx, consumer, handle, .. } = PipelineHarness::start("tone.m4a");
+        let mut renderer = AudioRenderer::new(consumer, shared.clone(), 48_000);
+        let started = Instant::now();
+        while shared.state.lock().unwrap().player_state == PlayerState::Loading
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let duration_us = shared.state.lock().unwrap().duration_us;
+        shared.audio_paused.store(false, Ordering::Relaxed);
+        cmd_tx.send(Command::SetLooping(true)).unwrap();
+        cmd_tx.send(Command::Play).unwrap();
+
+        let mut buf = vec![0.0f32; 480 * 2];
+        let started = Instant::now();
+        let mut next = started;
+        while started.elapsed() < Duration::from_secs(4) {
+            renderer.render(&mut buf, 2, Instant::now());
+            next += Duration::from_millis(10);
+            thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        let played = renderer.timeline.popped;
+        let state = shared.state.lock().unwrap().player_state;
+        let _ = cmd_tx.send(Command::Stop);
+        shared.stopping.store(true, Ordering::Relaxed);
+        let _ = handle.unwrap().join();
+
+        let one_pass = (duration_us as f64 / 1_000_000.0 * 96_000.0) as u64;
+        assert!(
+            played > one_pass * 2,
+            "a {:.1}s loop played only {:.1}s in 4s (state {:?})",
+            duration_us as f64 / 1e6,
+            played as f64 / 96_000.0,
+            state
+        );
     }
 
     // ------------------------------------------------------------------
